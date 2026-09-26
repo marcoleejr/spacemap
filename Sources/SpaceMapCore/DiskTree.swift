@@ -35,6 +35,21 @@ public final class DiskTree: @unchecked Sendable {
     /// Low nibble category, high nibble color category.
     var categories: [UInt8] = []
 
+    /// Files with more than one hard link. Only one link (`counted`) is a
+    /// node in the tree; `others` are directories holding the uncounted
+    /// links, so the space is never counted twice and can move to another
+    /// link when the counted one goes away.
+    struct LinkRecord {
+        var counted: UInt32
+        var others: [UInt32]
+    }
+    var links: [DiskScanner.FileIdentifier: LinkRecord] = [:]
+    /// Indexes over `links` so updates touch only the records involved.
+    private var countedByNode: [UInt32: DiskScanner.FileIdentifier] = [:]
+    private var uncountedByDirectory: [UInt32: Set<DiskScanner.FileIdentifier>] = [:]
+    /// Counted links detached since the last orphan sweep.
+    private var orphanCandidates = Set<DiskScanner.FileIdentifier>()
+
     /// Full path of node 0.
     public let rootPath: String
     /// Bumped by every mutation so views can cache layouts per version.
@@ -128,6 +143,110 @@ public final class DiskTree: @unchecked Sendable {
         return true
     }
 
+    // MARK: Hard links
+
+    /// True when `index` and every ancestor are still attached to the root.
+    func isReachable(_ index: UInt32) -> Bool {
+        var cursor = index
+        while Int(cursor) < nodeCount {
+            if !isAttached(cursor) { return false }
+            if cursor == 0 { return true }
+            cursor = parent[Int(cursor)]
+        }
+        return false
+    }
+
+    func recordCountedLink(_ id: DiskScanner.FileIdentifier, at index: UInt32) {
+        var record = links[id, default: LinkRecord(counted: DiskTree.none, others: [])]
+        if record.counted != DiskTree.none { countedByNode[record.counted] = nil }
+        record.counted = index
+        links[id] = record
+        countedByNode[index] = id
+    }
+
+    func recordUncountedLink(_ id: DiskScanner.FileIdentifier, in directory: UInt32) {
+        var record = links[id, default: LinkRecord(counted: DiskTree.none, others: [])]
+        if !record.others.contains(directory) { record.others.append(directory) }
+        links[id] = record
+        uncountedByDirectory[directory, default: []].insert(id)
+    }
+
+    func forgetUncountedLink(_ id: DiskScanner.FileIdentifier, in directory: UInt32) {
+        links[id]?.others.removeAll { $0 == directory }
+        uncountedByDirectory[directory]?.remove(id)
+        if uncountedByDirectory[directory]?.isEmpty == true { uncountedByDirectory[directory] = nil }
+        if let record = links[id], record.counted == DiskTree.none, record.others.isEmpty { links[id] = nil }
+    }
+
+    /// Uncounted links currently recorded for `directory`.
+    func uncountedLinks(in directory: UInt32) -> Set<DiskScanner.FileIdentifier> {
+        uncountedByDirectory[directory] ?? []
+    }
+
+    private func dropLinkRecord(_ id: DiskScanner.FileIdentifier) {
+        guard let record = links.removeValue(forKey: id) else { return }
+        if record.counted != DiskTree.none, countedByNode[record.counted] == id { countedByNode[record.counted] = nil }
+        for directory in record.others {
+            uncountedByDirectory[directory]?.remove(id)
+            if uncountedByDirectory[directory]?.isEmpty == true { uncountedByDirectory[directory] = nil }
+        }
+    }
+
+    /// Queues counted links inside a subtree that is leaving the tree.
+    private func noteDetachedLinks(under index: UInt32) {
+        guard !countedByNode.isEmpty else { return }
+        guard isDirectory(index) else {
+            if let id = countedByNode[index] { orphanCandidates.insert(id) }
+            return
+        }
+        var stack = [index]
+        while let node = stack.popLast() {
+            for child in children(of: node) {
+                if isDirectory(child) { stack.append(child) }
+                else if let id = countedByNode[child] { orphanCandidates.insert(id) }
+            }
+        }
+    }
+
+    func rebuildLinkIndexes() {
+        countedByNode = [:]
+        uncountedByDirectory = [:]
+        orphanCandidates = []
+        for (id, record) in links {
+            if record.counted != DiskTree.none { countedByNode[record.counted] = id }
+            for directory in record.others { uncountedByDirectory[directory, default: []].insert(id) }
+        }
+    }
+
+    /// Identifiers whose counted link is in the tree (orphans are swept
+    /// after every update, so a counted index is a live one).
+    func countedLinkIdentifiers() -> Set<DiskScanner.FileIdentifier> {
+        Set(countedByNode.values)
+    }
+
+    /// Links whose counted copy just left the tree while other links remain
+    /// on disk: returns the directories to reread so one of them is counted.
+    /// Only links detached since the last sweep are examined, and each is
+    /// reported once (its record is then marked uncounted), so a directory
+    /// that cannot be read is never requested in a loop.
+    public func orphanedLinkDirectories() -> [UInt32] {
+        guard !orphanCandidates.isEmpty else { return [] }
+        var directories = Set<UInt32>()
+        for id in orphanCandidates {
+            guard let record = links[id], record.counted != DiskTree.none, !isReachable(record.counted) else { continue }
+            let live = record.others.filter { isReachable($0) }
+            if live.isEmpty {
+                dropLinkRecord(id)
+                continue
+            }
+            countedByNode[record.counted] = nil
+            links[id] = LinkRecord(counted: DiskTree.none, others: live)
+            directories.formUnion(live)
+        }
+        orphanCandidates = []
+        return directories.sorted()
+    }
+
     // MARK: Accessors
 
     func kind(of index: UInt32) -> DiskItemKind {
@@ -211,6 +330,10 @@ public final class DiskTree: @unchecked Sendable {
         var files: UInt32 = 0
         var dirs: UInt32 = 0
         var modifiedAt: Date?
+        /// Set for files with more than one hard link.
+        var link: DiskScanner.FileIdentifier?
+        /// Another link to the same file was already seen in this listing.
+        var duplicateLink = false
     }
 
     @discardableResult
@@ -298,6 +421,7 @@ public final class DiskTree: @unchecked Sendable {
     }
 
     private func detach(_ index: UInt32) {
+        noteDetachedLinks(under: index)
         garbageNodes += subtreeNodeCount(index)
         flags[Int(index)] |= 0x80
         parent[Int(index)] = DiskTree.none
@@ -306,6 +430,7 @@ public final class DiskTree: @unchecked Sendable {
     /// Copies `source`'s subtree at `sourceIndex` into this tree (unattached)
     /// and returns the new index. Used to graft rescanned directories.
     func copySubtree(from source: DiskTree, at sourceIndex: UInt32) -> UInt32 {
+        let tracksLinks = !source.links.isEmpty
         var remap: [UInt32: UInt32] = [:]
         func copyNode(_ s: UInt32, parent newParent: UInt32) -> UInt32 {
             let i = Int(s)
@@ -336,9 +461,22 @@ public final class DiskTree: @unchecked Sendable {
                 if source.childCount[Int(child)] > 0 {
                     remap[child] = newChild
                     stack.append(child)
+                } else if tracksLinks {
+                    remap[child] = newChild
                 }
             }
             setChildren(of: target, copied)
+        }
+        if tracksLinks {
+            for (id, record) in source.links {
+                if let counted = remap[record.counted] {
+                    let existing = links[id]?.counted ?? DiskTree.none
+                    // The scan was seeded with this tree's counted links, so a
+                    // counted copy here means the id was free.
+                    if existing == DiskTree.none || !isReachable(existing) { recordCountedLink(id, at: counted) }
+                }
+                for other in record.others { if let directory = remap[other] { recordUncountedLink(id, in: directory) } }
+            }
         }
         return newRoot
     }
@@ -408,7 +546,16 @@ public final class DiskTree: @unchecked Sendable {
             return copy.appendRaw(nameID: mappedName(s), parent: newParent, kindBits: flags[i] & 0x3, categoryByte: categories[i],
                                   allocated: allocated[i], apparent: apparent[i], files: files[i], dirs: dirs[i], mtime: mtime[i])
         }
-        _ = copyNode(0, parent: DiskTree.none)
+        // Nodes referenced by hard-link records, to carry the records over.
+        var linkTargets: [UInt32: UInt32] = [:]
+        if maxDepth == .max, !directoriesOnly {
+            for record in links.values {
+                linkTargets[record.counted] = DiskTree.none
+                for other in record.others { linkTargets[other] = DiskTree.none }
+            }
+        }
+        let copyRoot = copyNode(0, parent: DiskTree.none)
+        if linkTargets[0] != nil { linkTargets[0] = copyRoot }
         // Breadth-first keeps each directory's children contiguous and in order.
         var queue: [(source: UInt32, target: UInt32, depth: Int)] = [(0, 0, 0)]
         var head = 0
@@ -420,6 +567,7 @@ public final class DiskTree: @unchecked Sendable {
             for child in children(of: s) where !directoriesOnly || isDirectory(child) {
                 let newChild = copyNode(child, parent: t)
                 copied.append(newChild)
+                if !linkTargets.isEmpty, linkTargets[child] != nil { linkTargets[child] = newChild }
                 if isDirectory(child), childCount[Int(child)] > 0 { queue.append((child, newChild, depth + 1)) }
             }
             if !copied.isEmpty { copy.setChildren(of: t, copied) }
@@ -428,6 +576,13 @@ public final class DiskTree: @unchecked Sendable {
                 head = 0
             }
         }
+        for (id, record) in links {
+            let counted = linkTargets[record.counted] ?? DiskTree.none
+            let others = record.others.compactMap { linkTargets[$0] }.filter { $0 != DiskTree.none }
+            if counted == DiskTree.none && others.isEmpty { continue }
+            copy.links[id] = LinkRecord(counted: counted, others: others)
+        }
+        copy.rebuildLinkIndexes()
         if maxDepth == .max { copy.finishBuilding() }
         return copy
     }

@@ -252,4 +252,159 @@ final class IncrementalUpdateTests: XCTestCase {
         XCTAssertNotNil(tree.index(forPath: target))
         XCTAssertGreaterThan(watcher.latestEventId, 0)
     }
+
+    // MARK: - Review fixes
+
+    /// root/a/f (hard link 1), root/b/g (hard link 2 of the same file), root/c.txt
+    private func hardLinkFixture() throws -> (URL, DiskTree) {
+        let root = try temporaryDirectory()
+        for folder in ["a", "b"] {
+            try FileManager.default.createDirectory(at: root.appendingPathComponent(folder), withIntermediateDirectories: true)
+        }
+        try Data(repeating: 7, count: 40_000).write(to: root.appendingPathComponent("a/f"))
+        try FileManager.default.linkItem(at: root.appendingPathComponent("a/f"), to: root.appendingPathComponent("b/g"))
+        try Data(repeating: 3, count: 10).write(to: root.appendingPathComponent("c.txt"))
+        return (root, try DiskScanner.scan(rootURL: root).root.tree)
+    }
+
+    private func refresh(_ tree: DiskTree, _ path: String) throws -> [String] {
+        let patch = try XCTUnwrap(IncrementalUpdater.prepare(tree: tree, path: path, recursive: false, includeHidden: true))
+        let result = IncrementalUpdater.applyReturningRelinks(patch)
+        XCTAssertTrue(result.applied)
+        return result.relink
+    }
+
+    func testRefreshDoesNotCountAHardLinkTwice() throws {
+        let (root, tree) = try hardLinkFixture()
+        let once = tree.apparent[0]
+        XCTAssertEqual(once, 40_010, "scan counts the shared file once")
+        // Rereading either directory must not add the other link's bytes.
+        for folder in ["b", "a", "b"] { _ = try refresh(tree, root.appendingPathComponent(folder).path) }
+        XCTAssertEqual(tree.apparent[0], once)
+        XCTAssertEqual(tree.files[0], 2)
+        // A new link appearing in a third directory is not counted either.
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("d"), withIntermediateDirectories: true)
+        try FileManager.default.linkItem(at: root.appendingPathComponent("a/f"), to: root.appendingPathComponent("d/h"))
+        _ = try refresh(tree, root.path)
+        _ = try refresh(tree, root.appendingPathComponent("d").path)
+        XCTAssertEqual(tree.apparent[0], once)
+        assertTotalsConsistent(tree)
+    }
+
+    func testRemovingTheCountedLinkMovesItsSpaceToTheRemainingLink() throws {
+        let (root, tree) = try hardLinkFixture()
+        let countedPath = [root.appendingPathComponent("a/f").path, root.appendingPathComponent("b/g").path]
+            .first { tree.index(forPath: $0) != nil }!
+        let otherDirectory = countedPath.hasSuffix("/a/f") ? root.appendingPathComponent("b").path : root.appendingPathComponent("a").path
+        try FileManager.default.removeItem(atPath: countedPath)
+
+        let removal = IncrementalUpdater.removeReturningRelinks(path: countedPath, from: tree)
+        XCTAssertTrue(removal.removed)
+        XCTAssertEqual(removal.relink, [otherDirectory], "the surviving link's directory is reread")
+        XCTAssertEqual(tree.apparent[0], 10)
+        // Reported once: an unrelated update must not request it again (no refresh loop
+        // when that directory turns out to be unreadable).
+        XCTAssertEqual(try refresh(tree, root.path), [])
+        for path in removal.relink { _ = try refresh(tree, path) }
+        XCTAssertEqual(tree.apparent[0], 40_010, "the file still occupies its space through the other link")
+        assertTotalsConsistent(tree)
+
+        // Deleting the last link frees it for real.
+        let survivor = otherDirectory + (otherDirectory.hasSuffix("/a") ? "/f" : "/g")
+        try FileManager.default.removeItem(atPath: survivor)
+        let last = IncrementalUpdater.removeReturningRelinks(path: survivor, from: tree)
+        XCTAssertTrue(last.removed)
+        XCTAssertEqual(last.relink, [])
+        XCTAssertEqual(tree.apparent[0], 10)
+    }
+
+    func testHardLinkRecordsSurviveCompactionAndCache() throws {
+        let (root, tree) = try hardLinkFixture()
+        let url = try temporaryDirectory().appendingPathComponent("cache.bin")
+        IncrementalUpdater.remove(path: root.appendingPathComponent("c.txt").path, from: tree)
+        let compact = tree.compacted()
+        try ScanCache.save(compact, header: .init(rootPath: root.path, includeHidden: true, eventId: 1, volumeUUID: "V", entries: 3), to: url)
+        let loaded = try ScanCache.load(from: url).tree
+        XCTAssertEqual(loaded.links.count, 1)
+        // The reloaded tree still knows the second link: rereading it adds nothing.
+        _ = try refresh(loaded, root.appendingPathComponent("a").path)
+        _ = try refresh(loaded, root.appendingPathComponent("b").path)
+        XCTAssertEqual(loaded.apparent[0], 40_000)
+    }
+
+    private func writeCache(body: Data, header: ScanCache.Header, to url: URL) throws {
+        let compressed = try (body as NSData).compressed(using: .lz4) as Data
+        let json = try JSONEncoder().encode(header)
+        var output = Data("SMAP".utf8)
+        var length = UInt32(json.count)
+        withUnsafeBytes(of: &length) { output.append(contentsOf: $0) }
+        output.append(json)
+        output.append(compressed)
+        try output.write(to: url)
+    }
+
+    func testCorruptCacheLengthsAreRejectedWithoutCrashing() throws {
+        let url = try temporaryDirectory().appendingPathComponent("evil.bin")
+        let header = ScanCache.Header(rootPath: "/x", includeHidden: true, eventId: 0, volumeUUID: "V", entries: 1)
+        for count: UInt64 in [.max, UInt64(Int.max), UInt64(Int.max / 2), 1 << 62, 1_000_000] {
+            var body = Data()
+            var value = count
+            withUnsafeBytes(of: &value) { body.append(contentsOf: $0) }
+            body.append(Data(repeating: 0, count: 64))
+            try writeCache(body: body, header: header, to: url)
+            XCTAssertThrowsError(try ScanCache.load(from: url), "count \(count)")
+        }
+        // Header length pointing past the end of the file.
+        var bogus = Data("SMAP".utf8)
+        var huge = UInt32.max
+        withUnsafeBytes(of: &huge) { bogus.append(contentsOf: $0) }
+        try bogus.write(to: url)
+        XCTAssertThrowsError(try ScanCache.load(from: url))
+        XCTAssertNil(ScanCache.readHeader(from: url))
+    }
+
+    func testReadHeaderRejectsOtherFormatVersions() throws {
+        let url = try temporaryDirectory().appendingPathComponent("old.bin")
+        var header = ScanCache.Header(rootPath: "/x", includeHidden: true, eventId: 5, volumeUUID: "V", entries: 1)
+        header.formatVersion = 1
+        try writeCache(body: Data(), header: header, to: url)
+        XCTAssertNil(ScanCache.readHeader(from: url), "an old cache must not be offered at launch")
+        header.formatVersion = ScanCache.Header.currentFormat
+        try writeCache(body: Data(), header: header, to: url)
+        XCTAssertEqual(ScanCache.readHeader(from: url)?.eventId, 5)
+    }
+
+    func testUnreadableDirectoryIsReportedAsFailed() throws {
+        let (root, result) = try fixture()
+        let b = root.appendingPathComponent("a/b")
+        try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: b.path)
+        addTeardownBlock { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: b.path) }
+        guard case .failed = IncrementalUpdater.preparation(tree: result.root.tree, path: b.path, recursive: false, includeHidden: true) else {
+            return XCTFail("an unreadable directory must not look like a successful refresh")
+        }
+        guard case .unchanged = IncrementalUpdater.preparation(tree: result.root.tree, path: "/somewhere/else", recursive: false, includeHidden: true) else {
+            return XCTFail("paths outside the tree are a no-op")
+        }
+    }
+
+    func testEventIdOnlyAdvancesOverAppliedBatches() {
+        var tracker = AppliedEventTracker(applied: 100)
+        tracker.batchFinished(upTo: 120, failures: 0)
+        XCTAssertEqual(tracker.applied, 120)
+        // A failed reread: the id stays so a relaunch replays that change...
+        tracker.batchFinished(upTo: 150, failures: 1)
+        XCTAssertEqual(tracker.applied, 120)
+        // ...even if later batches succeed.
+        tracker.batchFinished(upTo: 200, failures: 0)
+        XCTAssertEqual(tracker.applied, 120)
+        XCTAssertTrue(tracker.frozen)
+        // A full scan is the new baseline.
+        tracker.reset(to: 300)
+        tracker.batchFinished(upTo: 310, failures: 0)
+        XCTAssertEqual(tracker.applied, 310)
+        XCTAssertFalse(tracker.frozen)
+        // Never moves backwards.
+        tracker.batchFinished(upTo: 305, failures: 0)
+        XCTAssertEqual(tracker.applied, 310)
+    }
 }

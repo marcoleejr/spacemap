@@ -53,9 +53,10 @@ public enum ScanEngine {
 }
 
 public enum DiskScanner {
-    struct FileIdentifier: Hashable, Sendable {
-        let device: UInt64
-        let object: UInt64
+    /// Device + file id of a file with several hard links.
+    public struct FileIdentifier: Hashable, Sendable {
+        public let device: UInt64
+        public let object: UInt64
     }
 
     /// Sharded hardlink deduplication so parallel workers never serialize on one
@@ -104,6 +105,9 @@ public enum DiskScanner {
         let colorCategory: DiskCategory
         /// Context for this entry's children (only used when kind is directory).
         let childContext: ScanCategoryContext
+        /// Another link to this file was already counted; the entry only
+        /// records where the uncounted link lives.
+        var duplicateLink = false
     }
 
     struct DirectoryTask: Sendable {
@@ -292,6 +296,7 @@ public enum DiskScanner {
         cancellation: ScanCancellation = ScanCancellation(),
         seed: Seed? = nil,
         workers: Int? = nil,
+        knownLinks: Set<FileIdentifier> = [],
         progressInterval: TimeInterval = 0.25,
         progress: ((DiskScanProgress) -> Void)? = nil
     ) throws -> DiskScanResult {
@@ -404,6 +409,7 @@ public enum DiskScanner {
         let coordinator = WorkCoordinator(rootTask: rootTask)
         activePathProvider = { coordinator.activePath }
         let deduplicator = HardlinkDeduplicator()
+        for link in knownLinks { _ = deduplicator.insert(link) }
         let workerCount = max(1, min(workers ?? maxWorkers, ProcessInfo.processInfo.activeProcessorCount))
         let group = DispatchGroup()
         let queue = DispatchQueue(label: "SpaceMap.directory-workers", qos: .utility, attributes: .concurrent)
@@ -488,11 +494,16 @@ public enum DiskScanner {
                             ))
                         }
                     } else {
+                        if let link = entry.fileIdentifier, entry.duplicateLink {
+                            tree.recordUncountedLink(link, in: directory)
+                            continue
+                        }
                         let child = tree.appendNode(DiskTree.NodeValues(
                             name: entry.name, kind: kind, category: entry.category, color: entry.colorCategory,
                             allocated: entry.allocatedBytes, apparent: entry.apparentBytes, files: 1,
                             modifiedAt: entry.modifiedAt
                         ), parent: directory)
+                        if let link = entry.fileIdentifier { tree.recordCountedLink(link, at: child) }
                         childIndices.append(child)
                         addedAllocated &+= entry.allocatedBytes
                         addedApparent &+= entry.apparentBytes
@@ -596,11 +607,12 @@ public enum DiskScanner {
                         errors: &errors
                     ) {
                         if let identifier = entry.fileIdentifier, entry.kind == .file {
-                            if deduplicator.insert(identifier) {
-                                entries.append(entry)
-                            } else {
+                            var entry = entry
+                            if !deduplicator.insert(identifier) {
                                 deduplicated += 1
+                                entry.duplicateLink = true
                             }
+                            entries.append(entry)
                         } else {
                             entries.append(entry)
                         }
@@ -814,10 +826,8 @@ public enum DiskScanner {
             let device = UInt64(truncatingIfNeeded: status.st_dev)
             let classified = classifyForEntry(name: name, task: task)
             let identifier = kind == .file && status.st_nlink > 1 ? FileIdentifier(device: device, object: UInt64(status.st_ino)) : nil
-            if let identifier, !deduplicator.insert(identifier) {
-                deduplicated += 1
-                continue
-            }
+            let duplicate = identifier.map { !deduplicator.insert($0) } ?? false
+            if duplicate { deduplicated += 1 }
             entries.append(EntryRecord(
                 name: name,
                 path: childPath(path, name),
@@ -830,7 +840,8 @@ public enum DiskScanner {
                 errorCode: nil,
                 category: classified.category,
                 colorCategory: classified.color,
-                childContext: classified.context
+                childContext: classified.context,
+                duplicateLink: duplicate
             ))
         }
         return DirectoryReadResult(

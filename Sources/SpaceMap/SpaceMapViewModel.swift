@@ -43,13 +43,14 @@ final class SpaceMapViewModel: ObservableObject {
     private var cancellation: ScanCancellation?
     private var watcher: FileSystemWatcher?
     /// Highest FSEvents id whose changes are already in the tree.
-    private var appliedEventId: UInt64 = 0
+    private var eventTracker = AppliedEventTracker(applied: 0)
     private var cacheDirty = false
     private var cacheSaveWork: DispatchWorkItem?
     private var derivedWork: DispatchWorkItem?
     /// Serial utility queue for directory rereads, compaction and cache writes.
     private let updateQueue = DispatchQueue(label: "SpaceMap.incremental", qos: .utility)
-    private var terminationObserver: NSObjectProtocol?
+    /// The window's model, for the app delegate's quit-time cache save.
+    static weak var current: SpaceMapViewModel?
     /// Background churn (logs, browser caches) is folded into the tree right
     /// away but shown only once it adds up, so a busy home folder does not
     /// keep the map redrawing while the app sits idle.
@@ -75,11 +76,7 @@ final class SpaceMapViewModel: ObservableObject {
         ) { [weak self] _ in
             Task { @MainActor in self?.refreshFullDiskAccess() }
         }
-        terminationObserver = NotificationCenter.default.addObserver(
-            forName: NSApplication.willTerminateNotification, object: nil, queue: .main
-        ) { [weak self] _ in
-            MainActor.assumeIsolated { self?.saveCacheNow() }
-        }
+        SpaceMapViewModel.current = self
         refreshVolume()
     }
 
@@ -155,7 +152,7 @@ final class SpaceMapViewModel: ObservableObject {
                 self.isScanning = false
                 if let initial = self.initialSelection(in: loaded.tree.root) { self.selectedPath = initial }
                 trace("launch: opened cached map (\(loaded.header.entries) entries), replaying FSEvents since \(loaded.header.eventId)")
-                self.appliedEventId = loaded.header.eventId
+                self.eventTracker.reset(to: loaded.header.eventId)
                 // Replays every change since the cached scan, then keeps watching.
                 self.startWatching(since: loaded.header.eventId)
             }
@@ -231,7 +228,7 @@ final class SpaceMapViewModel: ObservableObject {
                     self.isScanning = false
                     self.selectedPath = self.initialSelection(in: result.root) ?? result.root.path
                     guard !result.metrics.cancelled else { return }
-                    self.appliedEventId = eventIdAtStart
+                    self.eventTracker.reset(to: eventIdAtStart)
                     self.startWatching(since: eventIdAtStart)
                     self.cacheDirty = true
                     self.scheduleCacheSave(after: 2)
@@ -289,7 +286,7 @@ final class SpaceMapViewModel: ObservableObject {
                 self.install(tree: result.root.tree, metrics: result.metrics)
                 if let selectedPath = self.selectedPath, result.root.tree.index(forPath: selectedPath) == nil { self.selectedPath = root.path }
                 if let focus = self.focusedRootPath, result.root.tree.index(forPath: focus) == nil { self.focusedRootPath = root.path }
-                self.appliedEventId = eventIdAtStart
+                self.eventTracker.reset(to: eventIdAtStart)
                 self.startWatching(since: eventIdAtStart)
                 self.cacheDirty = true
                 self.scheduleCacheSave(after: 2)
@@ -354,7 +351,9 @@ final class SpaceMapViewModel: ObservableObject {
         guard !isScanning, let tree = rootNode?.tree else { return }
         switch plan {
         case .nothing:
-            appliedEventId = max(appliedEventId, latestEventId)
+            // Credit the id only once earlier batches have landed.
+            if draining || !pendingPaths.isEmpty { pendingEventId = max(pendingEventId, latestEventId) }
+            else { eventTracker.batchFinished(upTo: latestEventId, failures: 0) }
         case .fullRescan:
             trace("FSEvents dropped events or the root changed: verifying in the background")
             verifyInBackground()
@@ -392,22 +391,35 @@ final class SpaceMapViewModel: ObservableObject {
         let before = tree.root.allocatedBytes
         updateQueue.async { [weak self] in
             var changed = false
+            var failures = 0
+            var relink: [String] = []
             // Parents first, and each patch lands before the next directory is
             // read, so every read sees the tree as it is now.
             for path in batch.keys.sorted() {
-                guard let patch = IncrementalUpdater.prepare(tree: tree, path: path, recursive: batch[path] ?? false, includeHidden: hidden) else { continue }
-                let applied = DispatchQueue.main.sync {
-                    MainActor.assumeIsolated { () -> Bool in
-                        guard self?.rootNode?.tree === tree else { return false }
-                        return IncrementalUpdater.apply(patch)
+                let patch: DirectoryPatch
+                switch IncrementalUpdater.preparation(tree: tree, path: path, recursive: batch[path] ?? false, includeHidden: hidden) {
+                case let .patch(prepared): patch = prepared
+                case .unchanged: continue
+                case .failed:
+                    failures += 1
+                    continue
+                }
+                let result = DispatchQueue.main.sync {
+                    MainActor.assumeIsolated { () -> (applied: Bool, relink: [String]) in
+                        guard self?.rootNode?.tree === tree else { return (false, []) }
+                        return IncrementalUpdater.applyReturningRelinks(patch)
                     }
                 }
-                changed = changed || applied
+                changed = changed || result.applied
+                relink += result.relink
             }
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.draining = false
-                self.appliedEventId = max(self.appliedEventId, eventId)
+                self.eventTracker.batchFinished(upTo: eventId, failures: failures)
+                // Another link of a removed hard-linked file now carries its space.
+                if !relink.isEmpty { trace("relink \(relink.count): \(relink.prefix(3)) failures=\(failures) batch=\(batch.count)") }
+                for path in relink where self.pendingPaths[path] == nil { self.pendingPaths[path] = false }
                 if changed, self.rootNode?.tree === tree { self.noteChange(in: tree, bytesBefore: before, userInitiated: userInitiated) }
                 self.drainPending()
             }
@@ -477,33 +489,41 @@ final class SpaceMapViewModel: ObservableObject {
         let work = DispatchWorkItem { [weak self] in
             Task { @MainActor [weak self] in
                 self?.cacheSaveWork = nil
-                self?.saveCache(synchronously: false)
+                self?.saveCache()
             }
         }
         cacheSaveWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
-    private func saveCacheNow() { saveCache(synchronously: true) }
+    /// Quit path: the save (and any compaction) runs on the update queue so
+    /// the main thread stays responsive; `completion` runs on main after it.
+    func saveCacheBeforeQuit(completion: @escaping () -> Void) {
+        cacheSaveWork?.cancel()
+        saveCache(completion: completion)
+    }
 
-    private func saveCache(synchronously: Bool) {
-        guard cacheDirty, !isScanning, let tree = rootNode?.tree, !metrics.cancelled else { return }
+    private func saveCache(completion: (() -> Void)? = nil) {
+        guard cacheDirty, !isScanning, let tree = rootNode?.tree, !metrics.cancelled else {
+            if let completion { DispatchQueue.main.async(execute: completion) }
+            return
+        }
         cacheDirty = false
         let header = ScanCache.Header(
             rootPath: tree.rootPath,
             includeHidden: includeHiddenFiles,
-            eventId: appliedEventId,
+            eventId: eventTracker.applied,
             volumeUUID: FileSystemWatcher.volumeUUID(forPath: tree.rootPath),
             entries: max(metrics.entriesScanned, tree.liveNodeCount),
             scanDuration: metrics.duration
         )
-        let work = {
+        updateQueue.async {
             tree.read {
                 let source = tree.garbageNodes == 0 ? tree : tree.compacted()
                 try? ScanCache.save(source, header: header)
             }
+            if let completion { DispatchQueue.main.async(execute: completion) }
         }
-        if synchronously { work() } else { updateQueue.async(execute: work) }
     }
 
     func refreshVolume() {
@@ -589,8 +609,12 @@ final class SpaceMapViewModel: ObservableObject {
         markedPaths.remove(path)
         // No rescan: drop the node and subtract it from every ancestor.
         let trashed = ProcessInfo.processInfo.systemUptime
-        guard let tree = rootNode?.tree, IncrementalUpdater.remove(path: path, from: tree) else { return }
+        guard let tree = rootNode?.tree else { return }
+        let removal = IncrementalUpdater.removeReturningRelinks(path: path, from: tree)
+        guard removal.removed else { return }
         treeDidChange()
+        // Hard-linked files keep their space through another link: count that one.
+        if !removal.relink.isEmpty { refresh(paths: Dictionary(uniqueKeysWithValues: removal.relink.map { ($0, false) }), in: tree, userInitiated: true) }
         let updated = ProcessInfo.processInfo.systemUptime
         trace(String(format: "trash: moved in %.1f ms, tree + totals + volume updated in %.1f ms (no rescan)", (trashed - started) * 1000, (updated - trashed) * 1000))
         // Our own FSEvents are ignored, so pick up the item's new home in the

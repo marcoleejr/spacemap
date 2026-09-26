@@ -19,9 +19,14 @@ public struct DirectoryPatch: @unchecked Sendable {
 }
 
 public enum IncrementalUpdater {
-    /// Re-reads the deepest existing directory for `path`. Existing
-    /// subdirectories keep their subtrees (their own events cover changes
-    /// inside them) unless `recursive`, in which case they are rescanned.
+    public enum Preparation {
+        case patch(DirectoryPatch)
+        /// Nothing to do (path outside the tree, directory already gone).
+        case unchanged
+        /// The directory could not be read; its change is not in the tree.
+        case failed
+    }
+
     public static func prepare(
         tree: DiskTree,
         path: String,
@@ -29,6 +34,22 @@ public enum IncrementalUpdater {
         includeHidden: Bool,
         cancellation: ScanCancellation = ScanCancellation()
     ) -> DirectoryPatch? {
+        if case let .patch(patch) = preparation(tree: tree, path: path, recursive: recursive, includeHidden: includeHidden, cancellation: cancellation) {
+            return patch
+        }
+        return nil
+    }
+
+    /// Re-reads the deepest existing directory for `path`. Existing
+    /// subdirectories keep their subtrees (their own events cover changes
+    /// inside them) unless `recursive`, in which case they are rescanned.
+    public static func preparation(
+        tree: DiskTree,
+        path: String,
+        recursive: Bool,
+        includeHidden: Bool,
+        cancellation: ScanCancellation = ScanCancellation()
+    ) -> Preparation {
         struct Existing { let index: UInt32; let isDirectory: Bool }
         let snapshot: (UInt32, String, DiskScanner.Seed, [String: Existing], UInt32?)? = tree.read {
             guard var found = tree.deepestNode(forPath: path) else { return nil }
@@ -52,15 +73,15 @@ public enum IncrementalUpdater {
             let parent = tree.parent[Int(index)]
             return (index, directoryPath, seed, existing, parent == DiskTree.none ? nil : parent)
         }
-        guard let (directory, directoryPath, seed, existing, _) = snapshot else { return nil }
+        guard let (directory, directoryPath, seed, existing, _) = snapshot else { return .unchanged }
 
         let listing = DiskScanner.listDirectory(path: directoryPath, seed: seed)
         if let error = listing.directoryError, error == ENOENT || error == ENOTDIR {
-            guard directory != 0 else { return nil }
-            return DirectoryPatch(tree: tree, directory: directory, path: directoryPath, removeDirectory: true,
-                                  kept: [], newLeaves: [], newSubtrees: [], newEmptyDirectories: [], gitCategory: nil)
+            guard directory != 0 else { return .failed }
+            return .patch(DirectoryPatch(tree: tree, directory: directory, path: directoryPath, removeDirectory: true,
+                                  kept: [], newLeaves: [], newSubtrees: [], newEmptyDirectories: [], gitCategory: nil))
         }
-        guard listing.directoryError == nil else { return nil }
+        guard listing.directoryError == nil else { return .failed }
 
         var rootStat = stat()
         let rootDevice: UInt64? = tree.rootPath.withCString { Darwin.lstat($0, &rootStat) } == 0
@@ -72,8 +93,9 @@ public enum IncrementalUpdater {
         var leaves: [DiskTree.NodeValues] = []
         var subtrees: [DiskTree] = []
         var emptyDirectories: [DiskTree.NodeValues] = []
+        var knownLinks: Set<DiskScanner.FileIdentifier>?
         for entry in listing.entries {
-            if cancellation.isCancelled { return nil }
+            if cancellation.isCancelled { return .failed }
             guard entry.errorCode == nil, let kind = entry.kind else { continue }
             if !includeHidden && entry.name.hasPrefix(".") { continue }
             let values = DiskTree.NodeValues(
@@ -81,7 +103,9 @@ public enum IncrementalUpdater {
                 allocated: kind == .file ? entry.allocatedBytes : 0,
                 apparent: kind == .file ? entry.apparentBytes : 0,
                 files: kind == .directory ? 0 : 1,
-                modifiedAt: entry.modifiedAt
+                modifiedAt: entry.modifiedAt,
+                link: kind == .file ? entry.fileIdentifier : nil,
+                duplicateLink: entry.duplicateLink
             )
             guard kind == .directory else {
                 leaves.append(values)
@@ -97,11 +121,14 @@ public enum IncrementalUpdater {
                 continue
             }
             let childSeed = DiskScanner.Seed(category: entry.category, color: entry.colorCategory, context: entry.childContext)
+            // Links already counted elsewhere in the tree stay uncounted here.
+            if knownLinks == nil { knownLinks = tree.read { tree.countedLinkIdentifiers() } }
             if let scanned = try? DiskScanner.scan(
                 rootURL: URL(fileURLWithPath: entry.path),
                 includeHidden: includeHidden,
                 cancellation: cancellation,
-                seed: childSeed
+                seed: childSeed,
+                knownLinks: knownLinks ?? []
             ) {
                 subtrees.append(scanned.root.tree)
             }
@@ -111,37 +138,79 @@ public enum IncrementalUpdater {
             let category = CategoryClassifier.classify(path: directoryPath, parentCategory: nil, hasGitDirectory: true)
             gitCategory = (category, category == .reclaimable ? seed.color : category)
         }
-        return DirectoryPatch(tree: tree, directory: directory, path: directoryPath, removeDirectory: false,
-                              kept: kept, newLeaves: leaves, newSubtrees: subtrees, newEmptyDirectories: emptyDirectories,
-                              gitCategory: gitCategory)
+        if cancellation.isCancelled { return .failed }
+        return .patch(DirectoryPatch(tree: tree, directory: directory, path: directoryPath, removeDirectory: false,
+                                     kept: kept, newLeaves: leaves, newSubtrees: subtrees, newEmptyDirectories: emptyDirectories,
+                                     gitCategory: gitCategory))
     }
 
     /// Applies a patch on the thread that owns mutations. Returns false when
     /// the directory changed underneath (it was removed meanwhile).
     @discardableResult
     public static func apply(_ patch: DirectoryPatch) -> Bool {
+        applyReturningRelinks(patch).applied
+    }
+
+    /// Like `apply`, plus the directories to reread because the counted link
+    /// of a hard-linked file left the tree while another link remains.
+    public static func applyReturningRelinks(_ patch: DirectoryPatch) -> (applied: Bool, relink: [String]) {
         let tree = patch.tree
         return tree.write {
             let directory = patch.directory
-            guard Int(directory) < tree.nodeCount, tree.isAttached(directory) else { return false }
-            if patch.removeDirectory { return tree.removeNode(directory) }
+            guard Int(directory) < tree.nodeCount, tree.isAttached(directory) else { return (false, []) }
+            if patch.removeDirectory {
+                let removed = tree.removeNode(directory)
+                return (removed, tree.orphanedLinkDirectories().map { tree.path(of: $0) })
+            }
             let kept = patch.kept.filter { tree.isAttached($0) && tree.parent[Int($0)] == directory }
+            // This directory was just reread: forget uncounted links it no longer holds.
+            let listed = Set(patch.newLeaves.compactMap(\.link))
+            for id in tree.uncountedLinks(in: directory) where !listed.contains(id) {
+                tree.forgetUncountedLink(id, in: directory)
+            }
             var added: [UInt32] = []
             added.reserveCapacity(patch.newLeaves.count + patch.newSubtrees.count + patch.newEmptyDirectories.count)
-            for leaf in patch.newLeaves + patch.newEmptyDirectories { added.append(tree.appendNode(leaf, parent: DiskTree.none)) }
+            for leaf in patch.newLeaves {
+                guard let link = leaf.link else {
+                    added.append(tree.appendNode(leaf, parent: DiskTree.none))
+                    continue
+                }
+                // Count a hard-linked file once: skip it when another link is
+                // counted elsewhere (a counted link in this directory is being replaced).
+                let counted = tree.links[link]?.counted ?? DiskTree.none
+                if leaf.duplicateLink
+                    || (counted != DiskTree.none && tree.isReachable(counted) && tree.parent[Int(counted)] != directory) {
+                    tree.recordUncountedLink(link, in: directory)
+                    continue
+                }
+                let index = tree.appendNode(leaf, parent: DiskTree.none)
+                tree.recordCountedLink(link, at: index)
+                tree.forgetUncountedLink(link, in: directory)
+                added.append(index)
+            }
+            for empty in patch.newEmptyDirectories { added.append(tree.appendNode(empty, parent: DiskTree.none)) }
             for subtree in patch.newSubtrees { added.append(tree.copySubtree(from: subtree, at: 0)) }
             if let (category, color) = patch.gitCategory { tree.setCategory(of: directory, category: category, color: color) }
             tree.replaceChildren(of: directory, kept: kept, added: added)
-            return true
+            let relink = tree.orphanedLinkDirectories().filter { $0 != directory }.map { tree.path(of: $0) }
+            return (true, relink)
         }
     }
 
     /// Removes the node at `path` and subtracts it from every ancestor.
     @discardableResult
     public static func remove(path: String, from tree: DiskTree) -> Bool {
+        removeReturningRelinks(path: path, from: tree).removed
+    }
+
+    /// Like `remove`, plus the directories holding other links of removed
+    /// hard-linked files: their space is still in use, so the caller rereads
+    /// them and one of those links becomes the counted one.
+    public static func removeReturningRelinks(path: String, from tree: DiskTree) -> (removed: Bool, relink: [String]) {
         tree.write {
-            guard let index = tree.index(forPath: path) else { return false }
-            return tree.removeNode(index)
+            guard let index = tree.index(forPath: path), tree.removeNode(index) else { return (false, []) }
+            let relink = tree.orphanedLinkDirectories().map { tree.path(of: $0) }
+            return (true, relink)
         }
     }
 }
@@ -193,6 +262,30 @@ public enum FileSystemEventPlanner {
             }
         }
         return .refresh(refreshes)
+    }
+}
+
+/// Highest FSEvents id whose changes are all in the tree; saved with the
+/// cache as the replay point. It only moves forward over batches that were
+/// fully applied. After a failed reread it stays put (so a relaunch replays
+/// that change again) until a full scan resets it.
+public struct AppliedEventTracker: Sendable, Equatable {
+    public private(set) var applied: UInt64
+    public private(set) var frozen = false
+
+    public init(applied: UInt64) { self.applied = applied }
+
+    /// A batch covering events up to `eventId` finished.
+    public mutating func batchFinished(upTo eventId: UInt64, failures: Int) {
+        if failures > 0 { frozen = true }
+        guard !frozen else { return }
+        applied = max(applied, eventId)
+    }
+
+    /// A fresh scan (or verification) is the new baseline.
+    public mutating func reset(to eventId: UInt64) {
+        applied = eventId
+        frozen = false
     }
 }
 
@@ -273,7 +366,8 @@ public final class FileSystemWatcher: @unchecked Sendable {
 /// history from the saved event id.
 public enum ScanCache {
     public struct Header: Codable, Sendable {
-        public var formatVersion = 1
+        public static let currentFormat = 2
+        public var formatVersion = Header.currentFormat
         public var rootPath: String
         public var includeHidden: Bool
         public var eventId: UInt64
@@ -315,6 +409,10 @@ public enum ScanCache {
         put(tree.nameID); put(tree.parent); put(tree.childStart); put(tree.childCount); put(tree.childList)
         put(tree.allocated); put(tree.apparent); put(tree.files); put(tree.dirs); put(tree.mtime)
         put(tree.flags); put(tree.categories)
+        // Hard-link records: parallel arrays, `others` flattened.
+        let records = Array(tree.links)
+        put(records.map(\.key.device)); put(records.map(\.key.object)); put(records.map(\.value.counted))
+        put(records.map { UInt32($0.value.others.count) }); put(records.flatMap(\.value.others))
         let compressed = try (body as NSData).compressed(using: .lz4) as Data
         let headerData = try JSONEncoder().encode(header)
         var output = Data(magic)
@@ -331,26 +429,32 @@ public enum ScanCache {
         defer { try? handle.close() }
         guard let prefix = try? handle.read(upToCount: 8), prefix.count == 8, Array(prefix.prefix(4)) == magic else { return nil }
         let length = prefix.dropFirst(4).withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }
-        guard length < 1 << 20, let json = try? handle.read(upToCount: Int(length)) else { return nil }
-        return try? JSONDecoder().decode(Header.self, from: json)
+        guard length < 1 << 20, let json = try? handle.read(upToCount: Int(length)), json.count == Int(length),
+              let header = try? JSONDecoder().decode(Header.self, from: json),
+              header.formatVersion == Header.currentFormat else { return nil }
+        return header
     }
 
     public static func load(from url: URL = defaultURL) throws -> (tree: DiskTree, header: Header) {
         let data = try Data(contentsOf: url, options: .alwaysMapped)
         guard data.count > 8, Array(data.prefix(4)) == magic else { throw CocoaError(.fileReadCorruptFile) }
         let headerLength = Int(data.dropFirst(4).prefix(4).withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) })
-        guard 8 + headerLength <= data.count else { throw CocoaError(.fileReadCorruptFile) }
+        guard headerLength <= data.count - 8 else { throw CocoaError(.fileReadCorruptFile) }
         let header = try JSONDecoder().decode(Header.self, from: data.subdata(in: 8..<8 + headerLength))
-        guard header.formatVersion == 1 else { throw CocoaError(.fileReadCorruptFile) }
+        guard header.formatVersion == Header.currentFormat else { throw CocoaError(.fileReadCorruptFile) }
         let body = try (data.subdata(in: 8 + headerLength..<data.count) as NSData).decompressed(using: .lz4) as Data
         let tree = DiskTree(rootPath: header.rootPath)
         var offset = 0
         func take<T>(_: T.Type) throws -> [T] {
-            guard offset + 8 <= body.count else { throw CocoaError(.fileReadCorruptFile) }
-            let count = Int(body.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: UInt64.self) })
+            // Every length comes from the file: check it before any arithmetic
+            // so a corrupt cache is rejected instead of trapping at launch.
+            guard body.count - offset >= 8 else { throw CocoaError(.fileReadCorruptFile) }
+            let rawCount = body.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: UInt64.self) }
             offset += 8
-            let byteCount = count * MemoryLayout<T>.stride
-            guard count >= 0, offset + byteCount <= body.count else { throw CocoaError(.fileReadCorruptFile) }
+            guard let count = Int(exactly: rawCount) else { throw CocoaError(.fileReadCorruptFile) }
+            let (byteCount, overflow) = count.multipliedReportingOverflow(by: MemoryLayout<T>.stride)
+            guard !overflow, byteCount <= body.count - offset else { throw CocoaError(.fileReadCorruptFile) }
+            guard count > 0 else { return [] }
             let array = [T](unsafeUninitializedCapacity: count) { buffer, initialized in
                 body.withUnsafeBytes { raw in
                     memcpy(UnsafeMutableRawPointer(buffer.baseAddress!), raw.baseAddress! + offset, byteCount)
@@ -375,14 +479,33 @@ public enum ScanCache {
         tree.mtime = try take(UInt32.self)
         tree.flags = try take(UInt8.self)
         tree.categories = try take(UInt8.self)
+        let devices = try take(UInt64.self)
+        let objects = try take(UInt64.self)
+        let counted = try take(UInt32.self)
+        let otherCounts = try take(UInt32.self)
+        let others = try take(UInt32.self)
         let n = tree.nameID.count
+        guard devices.count == objects.count, devices.count == counted.count, devices.count == otherCounts.count,
+              otherCounts.reduce(0, { $0 + Int($1) }) == others.count,
+              counted.allSatisfy({ $0 == DiskTree.none || Int($0) < n }), others.allSatisfy({ Int($0) < n })
+        else { throw CocoaError(.fileReadCorruptFile) }
+        var cursor = 0
+        for index in devices.indices {
+            let count = Int(otherCounts[index])
+            tree.links[DiskScanner.FileIdentifier(device: devices[index], object: objects[index])] =
+                DiskTree.LinkRecord(counted: counted[index], others: Array(others[cursor..<cursor + count]))
+            cursor += count
+        }
+        tree.rebuildLinkIndexes()
         guard n > 0, [tree.parent.count, tree.childStart.count, tree.childCount.count, tree.allocated.count, tree.apparent.count,
                       tree.files.count, tree.dirs.count, tree.mtime.count, tree.flags.count, tree.categories.count].allSatisfy({ $0 == n }),
               tree.nameStart.count == tree.nameLength.count,
               tree.nameID.allSatisfy({ Int($0) < tree.nameStart.count }),
               zip(tree.childStart, tree.childCount).allSatisfy({ Int($0) + Int($1) <= tree.childList.count }),
               tree.childList.allSatisfy({ Int($0) < n }),
-              zip(tree.nameStart, tree.nameLength).allSatisfy({ Int($0) + Int($1) <= tree.nameBytes.count })
+              tree.parent.allSatisfy({ $0 == DiskTree.none || Int($0) < n }),
+              zip(tree.nameStart, tree.nameLength).allSatisfy({ Int($0) + Int($1) <= tree.nameBytes.count }),
+              offset == body.count
         else { throw CocoaError(.fileReadCorruptFile) }
         tree.finishBuilding()
         return (tree, header)
