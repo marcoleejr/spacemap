@@ -39,12 +39,14 @@ public enum ScanEngine {
         rootURL: URL,
         includeHidden: Bool = true,
         cancellation: ScanCancellation = ScanCancellation(),
+        workers: Int? = nil,
         progress: ((DiskScanProgress) -> Void)? = nil
     ) throws -> DiskScanResult {
         try DiskScanner.scan(
             rootURL: rootURL,
             includeHidden: includeHidden,
             cancellation: cancellation,
+            workers: workers,
             progress: progress
         )
     }
@@ -106,6 +108,7 @@ public enum DiskScanner {
 
     struct DirectoryTask: Sendable {
         let path: String
+        let node: UInt32
         let context: ScanCategoryContext
         let parentCategory: DiskCategory
         let parentColor: DiskCategory
@@ -113,6 +116,7 @@ public enum DiskScanner {
 
     struct DirectoryReadResult: Sendable {
         let path: String
+        var node: UInt32 = 0
         let entries: [EntryRecord]
         let scannedEntries: Int
         let errors: Int
@@ -120,123 +124,6 @@ public enum DiskScanner {
         let deduplicated: Int
         let directoryError: Int32?
         let containsGitDirectory: Bool
-    }
-
-    /// Directory-only builder. Files and symlinks are stored directly as
-    /// immutable DiskNode values, which avoids one class instance per file
-    /// (millions of allocations in a home-directory scan). Aggregated totals are
-    /// maintained incrementally in batches so progress snapshots never traverse
-    /// the full tree.
-    final class Builder {
-        let path: String
-        let name: String
-        var category: DiskCategory
-        var colorCategory: DiskCategory
-        let context: ScanCategoryContext
-        weak var parent: Builder?
-        var dirChildren: [Builder] = []
-        var fileChildren: [DiskNode] = []
-        var totalAllocated: UInt64 = 0
-        var totalApparent: UInt64 = 0
-        var totalFiles: Int = 0
-        var totalDirs: Int = 0
-        var latestModified: Date?
-
-        init(
-            path: String,
-            name: String,
-            category: DiskCategory,
-            colorCategory: DiskCategory,
-            context: ScanCategoryContext
-        ) {
-            self.path = path
-            self.name = name
-            self.category = category
-            self.colorCategory = colorCategory
-            self.context = context
-        }
-
-        /// Appends one directory result in batch: a single ancestor walk carries
-        /// the aggregated delta instead of one walk per entry.
-        func addBatch(files: [DiskNode], dirs: [Builder]) {
-            if files.isEmpty, dirs.isEmpty { return }
-            fileChildren.append(contentsOf: files)
-            var addedAllocated: UInt64 = 0
-            var addedApparent: UInt64 = 0
-            var addedFiles = 0
-            var newest = latestModified
-            for file in files {
-                addedAllocated &+= file.allocatedBytes
-                addedApparent &+= file.apparentBytes
-                addedFiles += 1
-                if let modified = file.modifiedAt,
-                   newest == nil || modified > newest! { newest = modified }
-            }
-            for dir in dirs {
-                dir.parent = self
-                dirChildren.append(dir)
-            }
-            let addedDirs = dirs.count
-            totalAllocated &+= addedAllocated
-            totalApparent &+= addedApparent
-            totalFiles += addedFiles
-            totalDirs += addedDirs
-            if let newest { latestModified = newest }
-            var node = parent
-            while let current = node {
-                current.totalAllocated &+= addedAllocated
-                current.totalApparent &+= addedApparent
-                current.totalFiles += addedFiles
-                current.totalDirs += addedDirs
-                if let newest,
-                   current.latestModified == nil || newest > current.latestModified! {
-                    current.latestModified = newest
-                }
-                node = current.parent
-            }
-        }
-
-        func markRepositoryRoot(parentCategory: DiskCategory?, parentColor: DiskCategory?) {
-            category = CategoryClassifier.classify(path: path, parentCategory: parentCategory, hasGitDirectory: true)
-            colorCategory = category == .reclaimable ? (parentColor ?? .code) : category
-        }
-
-        /// Mixed containers without their own category keep the neutral
-        /// `.documents` gray instead of inheriting a child's color.
-
-        func freeze(maxDepth: Int = .max, includeFiles: Bool = true) -> DiskNode {
-            let children: [DiskNode]
-            if maxDepth <= 0 {
-                children = []
-            } else if includeFiles {
-                var combined: [DiskNode] = []
-                combined.reserveCapacity(dirChildren.count + fileChildren.count)
-                for child in dirChildren { combined.append(child.freeze(maxDepth: maxDepth - 1, includeFiles: includeFiles)) }
-                combined.append(contentsOf: fileChildren)
-                children = combined
-            } else {
-                // Progress snapshots: directories only. Totals stay exact via
-                // the incremental aggregates; skipping millions of file leaf
-                // copies keeps the 150 ms cadence cheap.
-                var combined: [DiskNode] = []
-                combined.reserveCapacity(dirChildren.count)
-                for child in dirChildren { combined.append(child.freeze(maxDepth: maxDepth - 1, includeFiles: false)) }
-                children = combined
-            }
-            return DiskNode(
-                path: path,
-                name: name,
-                kind: .directory,
-                category: category,
-                colorCategory: colorCategory,
-                allocatedBytes: totalAllocated,
-                apparentBytes: totalApparent,
-                fileCount: totalFiles,
-                directoryCount: totalDirs,
-                modifiedAt: latestModified,
-                children: children
-            )
-        }
     }
 
     /// Coordinates a fixed set of workers. Locks are held only while queueing one directory result,
@@ -354,6 +241,7 @@ public enum DiskScanner {
     private static let commonModifiedTime: UInt32 = 0x00000400
     private static let commonFileID: UInt32 = 0x02000000
     private static let commonError: UInt32 = 0x20000000
+    private static let fileLinkCount: UInt32 = 0x00000001
     private static let fileDataLength: UInt32 = 0x00000200
     private static let fileDataAllocationSize: UInt32 = 0x00000400
 
@@ -380,15 +268,31 @@ public enum DiskScanner {
         return name.hasSuffix(".photoslibrary")
     }
 
-    /// Uses getattrlistbulk on each directory with a core-sized worker pool.
-    /// Classification runs inside workers (parallel, O(1) per entry from the
-    /// parent context); the coordinator only assembles batches. Symlinks are
-    /// returned as leaves; directory file IDs are checked against the root
-    /// volume before descent.
+    /// Classification of the scan root when it is a directory inside an
+    /// existing tree (incremental rescans), so its subtree is classified the
+    /// same way a full scan would have classified it.
+    public struct Seed: Sendable {
+        let category: DiskCategory
+        let color: DiskCategory
+        let context: ScanCategoryContext
+    }
+
+    /// Worker ceiling. Scanning is I/O bound; beyond a handful of threads APFS
+    /// metadata locks turn extra workers into system time, not throughput.
+    public static var maxWorkers = 8
+
+    /// Uses getattrlistbulk on each directory with a small worker pool at
+    /// utility QoS. Classification runs inside workers (O(1) per entry from
+    /// the parent context); the coordinator appends each directory's entries
+    /// to a compact `DiskTree` in one batch. Symlinks are leaves, hard links
+    /// count once, and descent never crosses to another volume.
     public static func scan(
         rootURL: URL,
         includeHidden: Bool = true,
         cancellation: ScanCancellation = ScanCancellation(),
+        seed: Seed? = nil,
+        workers: Int? = nil,
+        progressInterval: TimeInterval = 0.25,
         progress: ((DiskScanProgress) -> Void)? = nil
     ) throws -> DiskScanResult {
         let started = ProcessInfo.processInfo.systemUptime
@@ -408,9 +312,9 @@ public enum DiskScanner {
         let homePath = FileManager.default.homeDirectoryForCurrentUser.path
         let restricted = FullDiskAccessProbe.isRestricted()
         let skipPrefixes = restricted ? tccSkipPrefixes(homePath: homePath) : []
-        let rootContext = IncrementalClassifier.rootContext(forPath: rootPath)
-        let rootCategory = CategoryClassifier.classify(path: rootPath)
-        let rootColor = rootCategory == .reclaimable ? .code : rootCategory
+        let rootContext = seed?.context ?? IncrementalClassifier.rootContext(forPath: rootPath)
+        let rootCategory = seed?.category ?? CategoryClassifier.classify(path: rootPath)
+        let rootColor = seed?.color ?? (rootCategory == .reclaimable ? .code : rootCategory)
 
         var scanned = 1
         var errors = 0
@@ -418,26 +322,25 @@ public enum DiskScanner {
         var deduplicated = 0
         var skippedProtected = 0
         var currentPath = rootPath
-        var buildersByPath: [String: Builder] = [:]
-        buildersByPath.reserveCapacity(1 << 20)
         var lastPublished = started
         var activePathProvider: (() -> String?)?
 
+        let tree = DiskTree(rootPath: rootPath)
+        tree.reserveNodes(1 << 16)
+
         // Single-file roots need no worker pool.
         guard rootKind == .directory else {
-            let kind = rootKind
-            let leaf = DiskNode(
-                path: rootPath,
+            tree.appendNode(DiskTree.NodeValues(
                 name: lastComponent(of: rootPath),
-                kind: kind,
+                kind: rootKind,
                 category: rootCategory,
-                colorCategory: rootColor,
-                allocatedBytes: kind == .symlink ? 0 : allocatedBytes(from: rootStat),
-                apparentBytes: kind == .symlink ? 0 : apparentBytes(from: rootStat),
-                fileCount: 1,
-                directoryCount: 0,
+                color: rootColor,
+                allocated: rootKind == .symlink ? 0 : allocatedBytes(from: rootStat),
+                apparent: rootKind == .symlink ? 0 : apparentBytes(from: rootStat),
+                files: 1,
                 modifiedAt: modificationDate(from: rootStat)
-            )
+            ), parent: DiskTree.none)
+            tree.finishBuilding()
             let finalMetrics = ScanMetrics(
                 entriesScanned: scanned,
                 inaccessibleEntries: inaccessible,
@@ -447,18 +350,17 @@ public enum DiskScanner {
                 cancelled: cancellation.isCancelled,
                 currentPath: currentPath
             )
-            progress?(DiskScanProgress(root: leaf, metrics: finalMetrics))
-            return DiskScanResult(root: leaf, metrics: finalMetrics)
+            progress?(DiskScanProgress(root: tree.root, metrics: finalMetrics))
+            return DiskScanResult(root: tree.root, metrics: finalMetrics)
         }
 
-        let rootBuilder = Builder(
-            path: rootPath,
+        tree.appendNode(DiskTree.NodeValues(
             name: lastComponent(of: rootPath),
+            kind: .directory,
             category: rootCategory,
-            colorCategory: rootColor,
-            context: rootContext
-        )
-        buildersByPath[rootPath] = rootBuilder
+            color: rootColor,
+            modifiedAt: modificationDate(from: rootStat)
+        ), parent: DiskTree.none)
 
         func metrics(cancelled: Bool) -> ScanMetrics {
             ScanMetrics(
@@ -472,35 +374,41 @@ public enum DiskScanner {
             )
         }
 
-        func publish(force: Bool = false) {
+        func snapshot() -> DiskNode {
+            // Depth-limited, directories only: correct totals, cheap to copy.
+            tree.compacted(maxDepth: 5, directoriesOnly: true).root
+        }
+
+        func publish() {
             guard let progress else { return }
             let now = ProcessInfo.processInfo.systemUptime
-            guard force || now - lastPublished >= 0.15 else { return }
+            guard now - lastPublished >= progressInterval else { return }
             lastPublished = now
             if let activePath = activePathProvider?() { currentPath = activePath }
-            // Depth-limited snapshot: correct totals, cheap enough for 150 ms cadence.
-            progress(DiskScanProgress(root: rootBuilder.freeze(maxDepth: 5, includeFiles: false), metrics: metrics(cancelled: cancellation.isCancelled)))
+            progress(DiskScanProgress(root: snapshot(), metrics: metrics(cancelled: cancellation.isCancelled)))
         }
 
-        progress?(DiskScanProgress(root: rootBuilder.freeze(maxDepth: 5, includeFiles: false), metrics: metrics(cancelled: cancellation.isCancelled)))
-        guard !cancellation.isCancelled else {
-            let root = rootBuilder.freeze()
-            let finalMetrics = metrics(cancelled: true)
-            progress?(DiskScanProgress(root: root, metrics: finalMetrics))
-            return DiskScanResult(root: root, metrics: finalMetrics)
+        func finish() -> DiskScanResult {
+            tree.finishBuilding()
+            tree.shrinkToFit()
+            let finalMetrics = metrics(cancelled: cancellation.isCancelled)
+            progress?(DiskScanProgress(root: tree.root, metrics: finalMetrics))
+            return DiskScanResult(root: tree.root, metrics: finalMetrics)
         }
+
+        progress?(DiskScanProgress(root: snapshot(), metrics: metrics(cancelled: cancellation.isCancelled)))
+        guard !cancellation.isCancelled else { return finish() }
 
         let rootDevice = UInt64(truncatingIfNeeded: rootStat.st_dev)
-        let rootTask = DirectoryTask(path: rootPath, context: rootContext, parentCategory: rootCategory, parentColor: rootColor)
+        let rootTask = DirectoryTask(path: rootPath, node: 0, context: rootContext, parentCategory: rootCategory, parentColor: rootColor)
         let coordinator = WorkCoordinator(rootTask: rootTask)
         activePathProvider = { coordinator.activePath }
         let deduplicator = HardlinkDeduplicator()
-        deduplicator.reserveCapacity(4_000_000)
-        let workerCount = max(1, ProcessInfo.processInfo.activeProcessorCount)
+        let workerCount = max(1, min(workers ?? maxWorkers, ProcessInfo.processInfo.activeProcessorCount))
         let group = DispatchGroup()
-        let queue = DispatchQueue(label: "SpaceMap.directory-workers", attributes: .concurrent)
+        let queue = DispatchQueue(label: "SpaceMap.directory-workers", qos: .utility, attributes: .concurrent)
         for _ in 0..<workerCount {
-            queue.async(group: group, qos: .userInitiated) {
+            queue.async(group: group) {
                 // One reusable 256 KiB transfer buffer per worker thread: no
                 // per-directory malloc or bzero on the hot path.
                 var buffer = [UInt8](unsafeUninitializedCapacity: 256 * 1024) { _, count in
@@ -517,9 +425,11 @@ public enum DiskScanner {
             }
         }
 
+        var childIndices: [UInt32] = []
+        var childTasks: [DirectoryTask] = []
         while true {
             if cancellation.isCancelled { coordinator.cancelPending() }
-            if let result = coordinator.nextResult(timeout: 0.15) {
+            if let result = coordinator.nextResult(timeout: progressInterval) {
                 currentPath = result.path
                 scanned += result.scannedEntries
                 errors += result.errors
@@ -530,68 +440,75 @@ public enum DiskScanner {
                     if error == EACCES || error == EPERM { inaccessible += 1 }
                 }
 
-                var childTasks: [DirectoryTask] = []
-                if let directoryBuilder = buildersByPath[result.path] {
-                    if result.containsGitDirectory {
-                        directoryBuilder.markRepositoryRoot(
-                            parentCategory: directoryBuilder.parent?.category,
-                            parentColor: directoryBuilder.parent?.colorCategory
-                        )
+                childTasks.removeAll(keepingCapacity: true)
+                childIndices.removeAll(keepingCapacity: true)
+                let directory = result.node
+                if result.containsGitDirectory {
+                    let parentIndex = tree.parent[Int(directory)]
+                    let parentCategory = parentIndex == DiskTree.none ? nil : tree.category(of: parentIndex)
+                    let parentColor = parentIndex == DiskTree.none ? nil : tree.colorCategory(of: parentIndex)
+                    let category = CategoryClassifier.classify(path: result.path, parentCategory: parentCategory, hasGitDirectory: true)
+                    tree.setCategory(of: directory, category: category, color: category == .reclaimable ? (parentColor ?? .code) : category)
+                }
+                var addedAllocated: UInt64 = 0
+                var addedApparent: UInt64 = 0
+                var addedFiles: Int64 = 0
+                var addedDirs: Int64 = 0
+                var newest: UInt32 = 0
+                for entry in result.entries {
+                    if let error = entry.errorCode {
+                        errors += 1
+                        if error == EACCES || error == EPERM { inaccessible += 1 }
+                        continue
                     }
-                    var fileNodes: [DiskNode] = []
-                    var dirBuilders: [Builder] = []
-                    fileNodes.reserveCapacity(result.entries.count)
-                    childTasks.reserveCapacity(result.entries.count)
-                    for entry in result.entries {
-                        if let error = entry.errorCode {
-                            errors += 1
-                            if error == EACCES || error == EPERM { inaccessible += 1 }
+                    if !includeHidden && entry.name.hasPrefix(".") { continue }
+                    guard let kind = entry.kind else { continue }
+                    let seconds = DiskTree.seconds(entry.modifiedAt)
+                    newest = max(newest, seconds)
+                    if kind == .directory {
+                        if entry.device == rootDevice, !cancellation.isCancelled,
+                           isTCCSkipped(entry.path, prefixes: skipPrefixes, name: entry.name) {
+                            // Skipped subtree: counted as inaccessible, not shown.
+                            skippedProtected += 1
                             continue
                         }
-                        if !includeHidden && entry.name.hasPrefix(".") { continue }
-                        guard let kind = entry.kind else { continue }
-                        if kind == .directory {
-                            let child = Builder(
+                        let child = tree.appendNode(DiskTree.NodeValues(
+                            name: entry.name, kind: .directory, category: entry.category, color: entry.colorCategory,
+                            modifiedAt: entry.modifiedAt
+                        ), parent: directory)
+                        childIndices.append(child)
+                        addedDirs += 1
+                        if entry.device == rootDevice, !cancellation.isCancelled {
+                            childTasks.append(DirectoryTask(
                                 path: entry.path,
-                                name: entry.name,
-                                category: entry.category,
-                                colorCategory: entry.colorCategory,
-                                context: entry.childContext
-                            )
-                            dirBuilders.append(child)
-                            buildersByPath[entry.path] = child
-                            if entry.device == rootDevice, !cancellation.isCancelled {
-                                if isTCCSkipped(entry.path, prefixes: skipPrefixes, name: entry.name) {
-                                    skippedProtected += 1
-                                    // Drop the skipped subtree: it stays empty in
-                                    // the tree but is counted as inaccessible.
-                                    dirBuilders.removeLast()
-                                    buildersByPath.removeValue(forKey: entry.path)
-                                } else {
-                                    childTasks.append(DirectoryTask(
-                                        path: entry.path,
-                                        context: entry.childContext,
-                                        parentCategory: entry.category,
-                                        parentColor: entry.colorCategory
-                                    ))
-                                }
-                            }
-                        } else {
-                            fileNodes.append(DiskNode(
-                                path: entry.path,
-                                name: entry.name,
-                                kind: kind,
-                                category: entry.category,
-                                colorCategory: entry.colorCategory,
-                                allocatedBytes: entry.allocatedBytes,
-                                apparentBytes: entry.apparentBytes,
-                                fileCount: 1,
-                                directoryCount: 0,
-                                modifiedAt: entry.modifiedAt
+                                node: child,
+                                context: entry.childContext,
+                                parentCategory: entry.category,
+                                parentColor: entry.colorCategory
                             ))
                         }
+                    } else {
+                        let child = tree.appendNode(DiskTree.NodeValues(
+                            name: entry.name, kind: kind, category: entry.category, color: entry.colorCategory,
+                            allocated: entry.allocatedBytes, apparent: entry.apparentBytes, files: 1,
+                            modifiedAt: entry.modifiedAt
+                        ), parent: directory)
+                        childIndices.append(child)
+                        addedAllocated &+= entry.allocatedBytes
+                        addedApparent &+= entry.apparentBytes
+                        addedFiles += 1
                     }
-                    directoryBuilder.addBatch(files: fileNodes, dirs: dirBuilders)
+                }
+                if !childIndices.isEmpty {
+                    tree.setChildren(of: directory, childIndices)
+                    tree.applyDelta(
+                        from: directory,
+                        allocated: Int64(bitPattern: addedAllocated),
+                        apparent: Int64(bitPattern: addedApparent),
+                        files: addedFiles,
+                        dirs: addedDirs,
+                        newest: newest
+                    )
                 }
                 coordinator.completeTask(children: childTasks, cancelled: cancellation.isCancelled)
             } else if coordinator.isSettled {
@@ -602,10 +519,14 @@ public enum DiskScanner {
 
         group.wait()
         if let activePath = coordinator.activePath { currentPath = activePath }
-        let root = rootBuilder.freeze()
-        let finalMetrics = metrics(cancelled: cancellation.isCancelled)
-        progress?(DiskScanProgress(root: root, metrics: finalMetrics))
-        return DiskScanResult(root: root, metrics: finalMetrics)
+        return finish()
+    }
+
+    /// Lists one directory without descending, for incremental updates.
+    static func listDirectory(path: String, seed: Seed) -> DirectoryReadResult {
+        var buffer = [UInt8](unsafeUninitializedCapacity: 256 * 1024) { _, count in count = 256 * 1024 }
+        let task = DirectoryTask(path: path, node: 0, context: seed.context, parentCategory: seed.category, parentColor: seed.color)
+        return readDirectory(task: task, cancellation: ScanCancellation(), deduplicator: HardlinkDeduplicator(), buffer: &buffer)
     }
 
     private static func readDirectory(
@@ -618,14 +539,14 @@ public enum DiskScanner {
         let descriptor = path.withCString { Darwin.open($0, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_DIRECTORY) }
         guard descriptor >= 0 else {
             let error = errno
-            return DirectoryReadResult(path: path, entries: [], scannedEntries: 0, errors: 0, inaccessibleEntries: 0, deduplicated: 0, directoryError: error, containsGitDirectory: false)
+            return DirectoryReadResult(path: path, node: task.node, entries: [], scannedEntries: 0, errors: 0, inaccessibleEntries: 0, deduplicated: 0, directoryError: error, containsGitDirectory: false)
         }
         defer { Darwin.close(descriptor) }
 
         var attributes = attrlist()
         attributes.bitmapcount = u_short(ATTR_BIT_MAP_COUNT)
         attributes.commonattr = 0xA200040B // returned attrs, name, device, type, mtime, file ID, per-entry error
-        attributes.fileattr = 0x00000600 // data length and allocated data size
+        attributes.fileattr = 0x00000601 // link count, data length and allocated data size
         var entries: [EntryRecord] = []
         var scannedEntries = 0
         var errors = 0
@@ -692,6 +613,7 @@ public enum DiskScanner {
         let containsGitDirectory = entries.contains { $0.name == ".git" && $0.kind != nil && $0.errorCode == nil }
         return DirectoryReadResult(
             path: path,
+            node: task.node,
             entries: entries,
             scannedEntries: scannedEntries,
             errors: errors,
@@ -735,6 +657,7 @@ public enum DiskScanner {
         var errorCode: Int32?
         var dataLength: UInt64?
         var allocationLength: UInt64?
+        var linkCount: UInt32 = 1
 
         for bit in [commonName, commonDevice, commonObjectType, commonModifiedTime, commonFileID, commonError] where common & bit != 0 {
             switch bit {
@@ -781,6 +704,11 @@ public enum DiskScanner {
             }
         }
 
+        if fileAttributes & fileLinkCount != 0 {
+            guard cursor + 4 <= recordOffset + recordLength else { errors += 1; return nil }
+            linkCount = bytes.loadUnaligned(fromByteOffset: cursor, as: UInt32.self)
+            cursor += 4
+        }
         for bit in [fileDataLength, fileDataAllocationSize] where fileAttributes & bit != 0 {
             guard cursor + MemoryLayout<off_t>.size <= recordOffset + recordLength else { errors += 1; return nil }
             let value = bytes.loadUnaligned(fromByteOffset: cursor, as: off_t.self)
@@ -803,6 +731,7 @@ public enum DiskScanner {
                 if device == nil { device = UInt64(truncatingIfNeeded: status.st_dev) }
                 if objectType == nil { objectType = Self.objectType(from: status.st_mode) }
                 if modifiedAt == nil { modifiedAt = modificationDate(from: status) }
+                if fileAttributes & fileLinkCount == 0 { linkCount = UInt32(status.st_nlink) }
                 if objectType == 1 {
                     if dataLength == nil { dataLength = apparentBytes(from: status) }
                     if allocationLength == nil { allocationLength = allocatedBytes(from: status) }
@@ -829,7 +758,9 @@ public enum DiskScanner {
             path: childPath(directoryPath, name),
             kind: kind,
             device: device,
-            fileIdentifier: kind == .file ? fileIdentifier : nil,
+            // Only multi-link files need deduplication; skipping the rest keeps
+            // the shared set tiny instead of one entry per file on disk.
+            fileIdentifier: kind == .file && linkCount > 1 ? fileIdentifier : nil,
             allocatedBytes: kind == .file ? (allocationLength ?? 0) : 0,
             apparentBytes: kind == .file ? (dataLength ?? 0) : 0,
             modifiedAt: modifiedAt,
@@ -851,7 +782,7 @@ public enum DiskScanner {
         guard duplicate >= 0, let stream = fdopendir(duplicate) else {
             if duplicate >= 0 { close(duplicate) }
             let error = errno
-            return DirectoryReadResult(path: path, entries: [], scannedEntries: 0, errors: 0, inaccessibleEntries: 0, deduplicated: 0, directoryError: error, containsGitDirectory: false)
+            return DirectoryReadResult(path: path, node: task.node, entries: [], scannedEntries: 0, errors: 0, inaccessibleEntries: 0, deduplicated: 0, directoryError: error, containsGitDirectory: false)
         }
         defer { closedir(stream) }
         var entries: [EntryRecord] = []
@@ -882,7 +813,7 @@ public enum DiskScanner {
             }
             let device = UInt64(truncatingIfNeeded: status.st_dev)
             let classified = classifyForEntry(name: name, task: task)
-            let identifier = kind == .file ? FileIdentifier(device: device, object: UInt64(status.st_ino)) : nil
+            let identifier = kind == .file && status.st_nlink > 1 ? FileIdentifier(device: device, object: UInt64(status.st_ino)) : nil
             if let identifier, !deduplicator.insert(identifier) {
                 deduplicated += 1
                 continue
@@ -904,6 +835,7 @@ public enum DiskScanner {
         }
         return DirectoryReadResult(
             path: path,
+            node: task.node,
             entries: entries,
             scannedEntries: scanned,
             errors: errors,

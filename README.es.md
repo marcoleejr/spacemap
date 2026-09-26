@@ -15,6 +15,10 @@ SpaceMap es un inspector de uso de disco para macOS: rápido y local. Analiza un
 - Panel de disco con libre/usado/total del volumen analizado
 - Mostrar en Finder y Mover a la papelera (confirmado)
 - Análisis incrementales y cancelables que nunca siguen symlinks ni cruzan volúmenes
+- Mover a la Papelera actualiza el mapa en el acto: resta el tamaño hasta la raíz, sin volver a escanear
+- Actualización en vivo con FSEvents: solo se releen las carpetas que cambiaron (en Finder o en otra app)
+- Abre al instante con el mapa anterior (caché en disco) y se pone al día con el historial de FSEvents
+- Liviana: árbol compacto (~50 bytes por entrada, nombres internados) y sin trabajo ni redibujos mientras nada cambia
 - Funciona con resultados parciales sin Acceso Total al Disco
 - Localizado en 6 idiomas (inglés, español, portugués, francés, alemán, japonés) — usa el idioma del sistema, con modo claro y oscuro
 
@@ -37,7 +41,7 @@ un ícono generado por `scripts/make-icon.sh` desde `scripts/icon.swift`.
 ## Pruebas
 
 ```sh
-swift test        # 22 casos XCTest: clasificador, squarify, escáner, catálogo
+swift test        # 32 casos XCTest: clasificador, squarify, escáner, catálogo, deltas, FSEvents, caché
 swift run -c release spacemap-bench ~   # rendimiento del motor en ~
 ```
 

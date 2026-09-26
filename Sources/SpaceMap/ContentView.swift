@@ -39,7 +39,7 @@ struct ContentView: View {
         .frame(minWidth: 1120, minHeight: 700)
         .focusable()
         .onKeyPress { keyPress in handle(keyPress) }
-        .onAppear { model.startScan() }
+        .onAppear { model.launch() }
         .onChange(of: showFilter) { _, active in
             if active { filterFocused = true }
             else { model.filterText = "" }
@@ -177,6 +177,17 @@ struct ContentView: View {
             }
             .padding(.horizontal, 16)
             .frame(height: 40)
+            // Real progress: entries so far against the previous scan of this root.
+            if model.isScanning, let expected = model.expectedEntries, expected > 0 {
+                GeometryReader { geometry in
+                    Capsule().fill(Theme.accent)
+                        .frame(width: geometry.size.width * min(0.99, CGFloat(model.metrics.entriesScanned) / CGFloat(expected)))
+                        .animation(.easeOut(duration: 0.25), value: model.metrics.entriesScanned)
+                }
+                .frame(height: 2)
+                .accessibilityLabel(L10n.string("summary.scanning"))
+                .accessibilityValue(Text("\(min(99, model.metrics.entriesScanned * 100 / expected))%"))
+            }
         }
         .background(Theme.background)
     }

@@ -8,46 +8,120 @@ private struct RenderTile {
     let level: Int
 }
 
+/// Layout inputs; the tiles are recomputed only when one of these changes.
+private struct LayoutKey: Equatable {
+    let tree: ObjectIdentifier
+    let version: Int
+    let focus: String?
+    let size: CGSize
+    let mode: TreemapMode
+    let depth: Int
+    let filter: String
+    let apparent: Bool
+}
+
+/// Holds the last layout (and the previous one while a change animates).
+/// A reference type so hover and selection never trigger a relayout.
+@MainActor
+private final class TreemapLayoutCache {
+    var key: LayoutKey?
+    var tree: DiskTree?
+    var tiles: [RenderTile] = []
+    var generation = 0
+    /// Frames before an in-place tree change, keyed by node index.
+    var previousFrames: [UInt32: CGRect] = [:]
+    var departing: [RenderTile] = []
+    var animationStart: Date?
+    static let duration: TimeInterval = 0.32
+
+    func isAnimating(at date: Date) -> Bool {
+        guard let animationStart else { return false }
+        return date.timeIntervalSince(animationStart) < TreemapLayoutCache.duration
+    }
+
+    /// Exponential ease-out progress in 0...1.
+    func progress(at date: Date) -> Double {
+        guard let animationStart else { return 1 }
+        let t = min(1, max(0, date.timeIntervalSince(animationStart) / TreemapLayoutCache.duration))
+        return t >= 1 ? 1 : 1 - pow(2, -10 * t)
+    }
+}
+
 struct TreemapCanvas: View {
     @ObservedObject var model: SpaceMapViewModel
     @Environment(\.colorScheme) private var scheme
     @State private var hoverPoint: CGPoint?
-    @State private var hoveredPath: String?
+    @State private var hoveredIndex: UInt32?
+    @State private var cache = TreemapLayoutCache()
+    @State private var settledGeneration = 0
 
     private var onLight: Bool { scheme == .light }
 
     var body: some View {
         GeometryReader { geometry in
             let size = geometry.size
-            let boxes = renderTiles(in: CGRect(origin: .zero, size: size))
+            let boxes = layout(in: size)
+            let animating = cache.animationStart != nil && settledGeneration != cache.generation
+            let hoveredTile = hoveredIndex.flatMap { index in boxes.last(where: { $0.node.index == index }) }
             ZStack(alignment: .topLeading) {
-                Canvas { context, _ in
-                    draw(boxes, in: &context)
+                TimelineView(.animation(minimumInterval: nil, paused: !animating)) { timeline in
+                    TreemapTilesLayer(
+                        tiles: boxes,
+                        generation: cache.generation,
+                        progress: animating ? cache.progress(at: timeline.date) : 1,
+                        previousFrames: animating ? cache.previousFrames : [:],
+                        departing: animating ? cache.departing : [],
+                        selectedIndex: model.selectedPath.flatMap { model.rootNode?.tree.index(forPath: $0) },
+                        onLight: onLight,
+                        mode: model.mode,
+                        apparent: model.useApparentSize
+                    )
+                    .equatable()
                 }
-                .contentShape(Rectangle())
-                .onTapGesture(count: 2) { point in
-                    if let tile = tile(at: point, in: boxes) {
-                        model.select(tile.node)
-                        model.openSelected()
+                .task(id: cache.generation) {
+                    // Pause the timeline once the change has settled: zero redraws at rest.
+                    guard animating else { return }
+                    try? await Task.sleep(for: .milliseconds(Int(TreemapLayoutCache.duration * 1000) + 30))
+                    settledGeneration = cache.generation
+                }
+
+                // Hover outline lives in its own layer so moving the pointer
+                // redraws one rectangle, not the whole map.
+                if let hoveredTile, hoveredTile.node.path != model.selectedPath, !animating {
+                    Canvas { context, _ in
+                        let rect = hoveredTile.frame
+                        let path = Path(roundedRect: rect, cornerRadius: min(7, min(rect.width, rect.height) * 0.18))
+                        context.stroke(path, with: .color(Theme.text.opacity(0.7)), lineWidth: 1)
                     }
+                    .allowsHitTesting(false)
                 }
-                .onTapGesture { point in
-                    if let tile = tile(at: point, in: boxes) { model.select(tile.node) }
-                }
-                .onContinuousHover { phase in
-                    switch phase {
-                    case let .active(point):
-                        hoverPoint = point
-                        hoveredPath = tile(at: point, in: boxes)?.node.path
-                    case .ended:
-                        hoverPoint = nil
-                        hoveredPath = nil
+
+                Color.clear
+                    .contentShape(Rectangle())
+                    .onTapGesture(count: 2) { point in
+                        if let tile = tile(at: point, in: boxes) {
+                            model.select(tile.node)
+                            model.openSelected()
+                        }
                     }
-                }
-                .contextMenu {
-                    Button(L10n.string("action.reveal")) { model.revealInFinder() }
-                    Button(L10n.string("action.trash"), role: .destructive) { NotificationCenter.default.post(name: .spaceMapRequestTrash, object: nil) }
-                }
+                    .onTapGesture { point in
+                        if let tile = tile(at: point, in: boxes) { model.select(tile.node) }
+                    }
+                    .onContinuousHover { phase in
+                        switch phase {
+                        case let .active(point):
+                            hoverPoint = point
+                            let index = tile(at: point, in: boxes)?.node.index
+                            if index != hoveredIndex { hoveredIndex = index }
+                        case .ended:
+                            hoverPoint = nil
+                            hoveredIndex = nil
+                        }
+                    }
+                    .contextMenu {
+                        Button(L10n.string("action.reveal")) { model.revealInFinder() }
+                        Button(L10n.string("action.trash"), role: .destructive) { NotificationCenter.default.post(name: .spaceMapRequestTrash, object: nil) }
+                    }
 
                 if boxes.isEmpty {
                     VStack(spacing: 10) {
@@ -61,10 +135,10 @@ struct TreemapCanvas: View {
                             .foregroundStyle(Theme.secondary)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .allowsHitTesting(false)
                 }
 
-                if let hoverPoint, let hoveredPath,
-                   let node = model.rootNode?.descendant(at: hoveredPath) {
+                if let hoverPoint, let node = hoveredTile?.node {
                     HStack(spacing: 7) {
                         Circle().fill(Theme.category(node.colorCategory)).frame(width: 8, height: 8)
                         Text(node.name).font(.system(size: 11, weight: .semibold))
@@ -81,6 +155,52 @@ struct TreemapCanvas: View {
             .background(Theme.sunken)
         }
         .accessibilityLabel(L10n.string("canvas.accessibility"))
+    }
+
+    /// Returns cached tiles unless a layout input changed. An in-place change
+    /// of the same tree (trash, FSEvents) keeps the old frames so the map can
+    /// glide to the new layout instead of jumping.
+    private func layout(in size: CGSize) -> [RenderTile] {
+        guard let tree = model.rootNode?.tree else {
+            cache.key = nil
+            cache.tree = nil
+            cache.tiles = []
+            return []
+        }
+        let key = LayoutKey(
+            tree: ObjectIdentifier(tree),
+            version: model.treeVersion,
+            focus: model.focusedRootPath,
+            size: size,
+            mode: model.mode,
+            depth: model.depth,
+            filter: model.filterText,
+            apparent: model.useApparentSize
+        )
+        if cache.key == key, cache.tree === tree { return cache.tiles }
+        let tiles = renderTiles(in: CGRect(origin: .zero, size: size))
+        let inPlaceChange = cache.tree === tree && cache.key.map {
+            $0.version != key.version && $0.focus == key.focus && $0.size == key.size && $0.mode == key.mode
+                && $0.depth == key.depth && $0.filter == key.filter && $0.apparent == key.apparent
+        } == true
+        if inPlaceChange, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion, !model.isScanning {
+            var previous: [UInt32: CGRect] = [:]
+            previous.reserveCapacity(cache.tiles.count)
+            for tile in cache.tiles { previous[tile.node.index] = tile.frame }
+            let remaining = Set(tiles.map(\.node.index))
+            cache.previousFrames = previous
+            cache.departing = cache.tiles.filter { !remaining.contains($0.node.index) }
+            cache.animationStart = Date()
+        } else {
+            cache.previousFrames = [:]
+            cache.departing = []
+            cache.animationStart = nil
+        }
+        cache.generation &+= 1
+        cache.key = key
+        cache.tree = tree
+        cache.tiles = tiles
+        return tiles
     }
 
     private func renderTiles(in bounds: CGRect) -> [RenderTile] {
@@ -116,8 +236,58 @@ struct TreemapCanvas: View {
         return output
     }
 
+    private func tile(at point: CGPoint, in tiles: [RenderTile]) -> RenderTile? {
+        tiles.reversed().first(where: { $0.frame.contains(point) })
+    }
+}
+
+/// The map itself. Equatable on its inputs, so hover, tooltips and
+/// unrelated model updates never redraw the tiles.
+private struct TreemapTilesLayer: View, Equatable {
+    let tiles: [RenderTile]
+    let generation: Int
+    let progress: Double
+    let previousFrames: [UInt32: CGRect]
+    let departing: [RenderTile]
+    let selectedIndex: UInt32?
+    let onLight: Bool
+    let mode: TreemapMode
+    let apparent: Bool
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.generation == rhs.generation && lhs.progress == rhs.progress && lhs.selectedIndex == rhs.selectedIndex
+            && lhs.onLight == rhs.onLight && lhs.mode == rhs.mode && lhs.apparent == rhs.apparent
+    }
+
+    var body: some View {
+        Canvas { context, _ in
+            if progress < 1 {
+                // Removed tiles collapse toward their centers as they fade.
+                for tile in departing {
+                    let scale = 1 - progress
+                    let frame = tile.frame.insetBy(dx: tile.frame.width * (1 - scale) / 2, dy: tile.frame.height * (1 - scale) / 2)
+                    var faded = context
+                    faded.opacity = scale
+                    draw([RenderTile(node: tile.node, frame: frame, pill: nil, level: tile.level)], in: &faded)
+                }
+                draw(tiles.map(interpolated), in: &context)
+            } else {
+                draw(tiles, in: &context)
+            }
+        }
+    }
+
+    private func interpolated(_ tile: RenderTile) -> RenderTile {
+        guard let from = previousFrames[tile.node.index] else { return tile }
+        func mix(_ a: CGFloat, _ b: CGFloat) -> CGFloat { a + (b - a) * progress }
+        let to = tile.frame
+        let frame = CGRect(x: mix(from.minX, to.minX), y: mix(from.minY, to.minY), width: mix(from.width, to.width), height: mix(from.height, to.height))
+        let pill = tile.pill.map { CGRect(x: frame.minX + 5, y: frame.minY + 5, width: min(frame.width - 10, $0.width), height: $0.height) }
+        return RenderTile(node: tile.node, frame: frame, pill: pill, level: tile.level)
+    }
+
     private func tileFill(_ node: DiskNode) -> Color {
-        let hue = model.mode == .age ? ageColor(node.modifiedAt) : Theme.category(node.colorCategory)
+        let hue = mode == .age ? ageColor(node.modifiedAt) : Theme.category(node.colorCategory)
         let base: Double = node.isDirectory ? 0.30 : 0.38
         return hue.opacity(onLight ? base * 0.62 : base)
     }
@@ -162,9 +332,8 @@ struct TreemapCanvas: View {
                 labelContext.draw(label, at: CGPoint(x: rect.minX + 7, y: rect.minY + 6), anchor: .topLeading)
             }
 
-            let selected = tile.node.path == model.selectedPath
-            let hovered = tile.node.path == hoveredPath
-            let borderColor: Color = selected ? Theme.accent : (hovered ? Theme.text.opacity(0.7) : (onLight ? Color(hex: 0xFFFFFF).opacity(0.9) : Color(hex: 0x0B0E14).opacity(0.8)))
+            let selected = tile.node.index == selectedIndex
+            let borderColor: Color = selected ? Theme.accent : (onLight ? Color(hex: 0xFFFFFF).opacity(0.9) : Color(hex: 0x0B0E14).opacity(0.8))
             context.stroke(path, with: .color(borderColor), lineWidth: selected ? 2 : 1)
             if tile.pill != nil {
                 var orbit = Path()
@@ -177,7 +346,7 @@ struct TreemapCanvas: View {
     }
 
     private func displayValue(for node: DiskNode) -> String {
-        switch model.mode {
+        switch mode {
         case .files:
             let compacted: String
             if node.fileCount >= 1_000_000 { compacted = String(format: "%.1fM", Double(node.fileCount) / 1_000_000) }
@@ -185,7 +354,7 @@ struct TreemapCanvas: View {
             else { compacted = "\(node.fileCount)" }
             return L10n.filesCompact(compacted, count: node.fileCount)
         case .size, .age:
-            return ByteFormatter.string(node.bytes(apparent: model.useApparentSize))
+            return ByteFormatter.string(node.bytes(apparent: apparent))
         }
     }
 
@@ -197,9 +366,6 @@ struct TreemapCanvas: View {
         return Color(red: (fresh.r + (old.r - fresh.r) * t) / 255, green: (fresh.g + (old.g - fresh.g) * t) / 255, blue: (fresh.b + (old.b - fresh.b) * t) / 255)
     }
 
-    private func tile(at point: CGPoint, in tiles: [RenderTile]) -> RenderTile? {
-        tiles.reversed().first(where: { $0.frame.contains(point) })
-    }
 }
 
 extension Notification.Name {

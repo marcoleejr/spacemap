@@ -54,23 +54,20 @@ public enum TreemapMode: String, CaseIterable, Sendable {
     public var title: String { rawValue.capitalized }
 }
 
-public struct DiskNode: Identifiable, Sendable {
-    public let path: String
-    public let name: String
-    public let kind: DiskItemKind
-    public let category: DiskCategory
-    /// Reclaimable nodes use their container's hue and a hatch overlay.
-    public let colorCategory: DiskCategory
-    public let allocatedBytes: UInt64
-    public let apparentBytes: UInt64
-    public let fileCount: Int
-    public let directoryCount: Int
-    public let modifiedAt: Date?
-    public let children: [DiskNode]
+/// Lightweight handle into a `DiskTree` arena. It owns nothing per node;
+/// every property reads the tree's parallel arrays, and `path` is rebuilt
+/// from parent links only when asked for.
+public struct DiskNode: Identifiable, Sendable, Equatable {
+    public let tree: DiskTree
+    public let index: UInt32
 
-    public var id: String { path }
-    public var isDirectory: Bool { kind == .directory }
+    public init(tree: DiskTree, index: UInt32) {
+        self.tree = tree
+        self.index = index
+    }
 
+    /// Standalone node (tests, placeholders). Children are copied into a
+    /// fresh tree, keeping their stored totals.
     public init(
         path: String,
         name: String,
@@ -84,17 +81,47 @@ public struct DiskNode: Identifiable, Sendable {
         modifiedAt: Date? = nil,
         children: [DiskNode] = []
     ) {
-        self.path = path
-        self.name = name
-        self.kind = kind
-        self.category = category
-        self.colorCategory = colorCategory ?? (category == .reclaimable ? .code : category)
-        self.allocatedBytes = allocatedBytes
-        self.apparentBytes = apparentBytes
-        self.fileCount = fileCount
-        self.directoryCount = directoryCount
-        self.modifiedAt = modifiedAt
-        self.children = children
+        let tree = DiskTree(rootPath: path)
+        tree.appendNode(DiskTree.NodeValues(
+            name: name,
+            kind: kind,
+            category: category,
+            color: colorCategory ?? (category == .reclaimable ? .code : category),
+            allocated: allocatedBytes,
+            apparent: apparentBytes,
+            files: UInt32(clamping: fileCount),
+            dirs: UInt32(clamping: directoryCount),
+            modifiedAt: modifiedAt
+        ), parent: DiskTree.none)
+        if !children.isEmpty {
+            let copied = children.map { tree.copySubtree(from: $0.tree, at: $0.index) }
+            tree.setChildren(of: 0, copied)
+        }
+        self.init(tree: tree, index: 0)
+    }
+
+    public static func == (lhs: DiskNode, rhs: DiskNode) -> Bool {
+        lhs.tree === rhs.tree && lhs.index == rhs.index
+    }
+
+    public var path: String { tree.path(of: index) }
+    public var id: String { path }
+    public var name: String { index == 0 ? DiskTree.lastComponent(of: tree.rootPath) : tree.name(of: index) }
+    public var kind: DiskItemKind { tree.kind(of: index) }
+    public var isDirectory: Bool { tree.isDirectory(index) }
+    public var category: DiskCategory { tree.category(of: index) }
+    /// Reclaimable nodes use their container's hue and a hatch overlay.
+    public var colorCategory: DiskCategory { tree.colorCategory(of: index) }
+    public var allocatedBytes: UInt64 { tree.allocated[Int(index)] }
+    public var apparentBytes: UInt64 { tree.apparent[Int(index)] }
+    public var fileCount: Int { Int(tree.files[Int(index)]) }
+    public var directoryCount: Int { Int(tree.dirs[Int(index)]) }
+    public var modifiedAt: Date? { tree.modified(of: index) }
+    public var childCount: Int { Int(tree.childCount[Int(index)]) }
+    public var children: [DiskNode] { tree.children(of: index).map { DiskNode(tree: tree, index: $0) } }
+    public var parentNode: DiskNode? {
+        let p = tree.parent[Int(index)]
+        return p == DiskTree.none ? nil : DiskNode(tree: tree, index: p)
     }
 
     public func bytes(apparent: Bool) -> UInt64 {
@@ -104,28 +131,22 @@ public struct DiskNode: Identifiable, Sendable {
     /// Follows path components instead of searching the full subtree, which keeps selection and hover lookup
     /// responsive even when the scan contains millions of nodes.
     public func descendant(at targetPath: String) -> DiskNode? {
-        if path == targetPath { return self }
-        guard let component = nextPathComponent(toward: targetPath) else { return nil }
-        let name = String(component)
-        guard let child = children.first(where: { $0.name == name }) else { return nil }
-        return child.descendant(at: targetPath)
+        ancestors(of: targetPath)?.last
     }
 
     public func ancestors(of targetPath: String) -> [DiskNode]? {
-        if path == targetPath { return [self] }
-        guard let component = nextPathComponent(toward: targetPath) else { return nil }
-        let name = String(component)
-        guard let child = children.first(where: { $0.name == name }),
-              let chain = child.ancestors(of: targetPath) else { return nil }
-        return [self] + chain
-    }
-
-    private func nextPathComponent(toward targetPath: String) -> Substring? {
-        let prefix = path == "/" ? "/" : path + "/"
+        let base = path
+        if base == targetPath { return [self] }
+        let prefix = base == "/" ? "/" : base + "/"
         guard targetPath.hasPrefix(prefix) else { return nil }
-        let remainder = targetPath.dropFirst(prefix.count)
-        guard let component = remainder.split(separator: "/", maxSplits: 1).first, !component.isEmpty else { return nil }
-        return component
+        var chain = [self]
+        var cursor = index
+        for component in targetPath.dropFirst(prefix.count).split(separator: "/") {
+            guard let next = tree.child(of: cursor, named: component) else { return nil }
+            cursor = next
+            chain.append(DiskNode(tree: tree, index: cursor))
+        }
+        return chain
     }
 }
 
@@ -200,7 +221,22 @@ public struct CleanupCandidate: Identifiable, Sendable {
         self.bytes = bytes
     }
 
-    public var id: String { node.path }
+    public var id: UInt32 { node.index }
+}
+
+public extension DiskTree {
+    /// Leaf bytes per category for the legend (each byte counted once).
+    func footprint(from start: UInt32 = 0) -> [DiskCategory: UInt64] {
+        var totals = [UInt64](repeating: 0, count: DiskCategory.allCases.count)
+        var stack = [start]
+        while let index = stack.popLast() {
+            if isDirectory(index) { stack.append(contentsOf: children(of: index)) }
+            else { totals[Int(categories[Int(index)] & 0xF)] &+= allocated[Int(index)] }
+        }
+        var result: [DiskCategory: UInt64] = [:]
+        for (code, bytes) in totals.enumerated() where bytes > 0 { result[DiskCategory.fromCode(UInt8(code))] = bytes }
+        return result
+    }
 }
 
 /// Shared cleanup-candidate mining used by the app inspector. Regenerable
@@ -212,7 +248,7 @@ public enum CleanupCandidates {
     public static let largeRepositoryBytes: UInt64 = 1 << 30
     public static let visibleLimit = 6
 
-    public static func collect(root: DiskNode, rootPath: String, now: Date = Date()) -> (items: [CleanupCandidate], totalBytes: UInt64) {
+    public static func collect(root: DiskNode, rootPath: String = "", now: Date = Date()) -> (items: [CleanupCandidate], totalBytes: UInt64) {
         let cutoff = now.addingTimeInterval(-Double(staleDays) * 24 * 60 * 60)
         var regenerable: [CleanupCandidate] = []
         var leftovers: [CleanupCandidate] = []
@@ -225,31 +261,38 @@ public enum CleanupCandidates {
                 list[smallestIndex] = candidate
             }
         }
-        func visit(_ node: DiskNode, ancestorIsCandidate: Bool) {
-            let stale = node.modifiedAt.map { $0 < cutoff } ?? false
-            let largeRepo = node.category == .git && node.allocatedBytes >= largeRepositoryBytes
-            let isRegenerable = node.category == .reclaimable
-                || node.category == .agentScratch
-                || node.category == .cache
-                || largeRepo
+        let tree = root.tree
+        let cutoffSeconds = DiskTree.seconds(cutoff)
+        // Iterative walk over the arena: no handle or child array per node.
+        var stack: [(UInt32, Bool)] = [(root.index, false)]
+        while let (index, ancestorIsCandidate) = stack.popLast() {
+            let i = Int(index)
+            let category = tree.category(of: index)
+            let bytes = tree.allocated[i]
+            let seconds = tree.mtime[i]
+            let stale = seconds != 0 && seconds < cutoffSeconds
+            let largeRepo = category == .git && bytes >= largeRepositoryBytes
+            let isRegenerable = category == .reclaimable || category == .agentScratch || category == .cache || largeRepo
             let qualifies = isRegenerable || stale
-            if node.path != rootPath, qualifies, !ancestorIsCandidate, node.allocatedBytes > 0 {
+            if index != root.index, qualifies, !ancestorIsCandidate, bytes > 0 {
+                let node = DiskNode(tree: tree, index: index)
                 let kind: CleanupCandidate.Kind
                 let subtitle: String
-                if node.category == .reclaimable { kind = .buildOutput; subtitle = "build output · safe to review" }
-                else if node.category == .cache { kind = .cache; subtitle = "regenerable cache" }
-                else if node.category == .agentScratch { kind = .agentWorkspace; subtitle = "agent workspace" }
+                if category == .reclaimable { kind = .buildOutput; subtitle = "build output · safe to review" }
+                else if category == .cache { kind = .cache; subtitle = "regenerable cache" }
+                else if category == .agentScratch { kind = .agentWorkspace; subtitle = "agent workspace" }
                 else if largeRepo { kind = .largeRepository; subtitle = "large repository" }
-                else if node.category == .media { kind = .oldMedia; subtitle = "old media" }
+                else if category == .media { kind = .oldMedia; subtitle = "old media" }
                 else { kind = .oldOther(node.modifiedAt); subtitle = "old · last write \(ByteFormatter.relativeAge(from: node.modifiedAt, now: now))" }
-                let candidate = CleanupCandidate(node: node, kind: kind, subtitle: subtitle, bytes: node.allocatedBytes)
-                totalBytes &+= node.allocatedBytes
+                let candidate = CleanupCandidate(node: node, kind: kind, subtitle: subtitle, bytes: bytes)
+                totalBytes &+= bytes
                 if isRegenerable { insert(candidate, into: &regenerable) }
                 else { insert(candidate, into: &leftovers) }
             }
-            for child in node.children { visit(child, ancestorIsCandidate: ancestorIsCandidate || qualifies) }
+            // Nothing below a candidate can become one, so skip its subtree.
+            guard !(ancestorIsCandidate || qualifies) else { continue }
+            for child in tree.children(of: index) { stack.append((child, false)) }
         }
-        visit(root, ancestorIsCandidate: false)
         let items = (regenerable.sorted { $0.bytes > $1.bytes } + leftovers.sorted { $0.bytes > $1.bytes })
             .prefix(visibleLimit).map { $0 }
         return (items, totalBytes)

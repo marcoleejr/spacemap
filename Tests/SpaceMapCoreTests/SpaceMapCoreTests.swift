@@ -321,7 +321,7 @@ final class SpaceMapCoreTests: XCTestCase {
     // MARK: - Cleanup candidates
 
     func testCleanupCandidatesFindExpectedKinds() {
-        let now = Date(timeIntervalSince1970: 3_000_000)
+        let now = Date(timeIntervalSince1970: 1_780_000_000)
         func leaf(_ path: String, _ name: String, _ category: DiskCategory, _ bytes: UInt64, modified: Date) -> DiskNode {
             DiskNode(path: path, name: name, kind: .directory, category: category,
                      allocatedBytes: bytes, apparentBytes: bytes,
@@ -356,7 +356,7 @@ final class SpaceMapCoreTests: XCTestCase {
     }
 
     func testCleanupCandidatesPrioritizeRegenerableOverOldMedia() {
-        let now = Date(timeIntervalSince1970: 3_000_000)
+        let now = Date(timeIntervalSince1970: 1_780_000_000)
         let recent = now.addingTimeInterval(-60 * 60)
         let old = now.addingTimeInterval(-400 * 24 * 60 * 60)
         // Old media is 10x bigger than the cache, yet regenerable wins.
@@ -378,7 +378,7 @@ final class SpaceMapCoreTests: XCTestCase {
     }
 
     func testCleanupCandidatesIgnoreZeroByteAndFreshSmallNodes() {
-        let now = Date(timeIntervalSince1970: 3_000_000)
+        let now = Date(timeIntervalSince1970: 1_780_000_000)
         let recent = now.addingTimeInterval(-3600)
         let empty = DiskNode(path: "/r/empty", name: "empty", kind: .directory, category: .cache,
                              allocatedBytes: 0, apparentBytes: 0, fileCount: 0, directoryCount: 0, modifiedAt: recent)
