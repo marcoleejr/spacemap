@@ -17,6 +17,10 @@ let startUptime = ProcessInfo.processInfo.systemUptime
 var lastProgressTime = startUptime
 var progressSnapshots = 0
 
+if let workers = ProcessInfo.processInfo.environment["SPACEMAP_WORKERS"].flatMap(Int.init) {
+    DiskScanner.maxWorkers = workers
+}
+
 do {
     // Same engine as the app: ScanEngine.scan is the only scan entry point
     // for both (see testAppAndBenchShareSameEngine).
@@ -49,6 +53,44 @@ do {
         progressSnapshots,
         String(result.metrics.cancelled)
     ))
+    let tree = result.root.tree
+    print(String(format: "tree_nodes=%d unique_names=%d name_pool=%.1fMB tree_bytes=%.1fMB", tree.nodeCount, tree.uniqueNameCount, Double(tree.namePoolBytes) / 1_048_576, Double(tree.approximateBytes) / 1_048_576))
+
+    // Incremental path: remove the largest file and time the delta propagation.
+    if ProcessInfo.processInfo.environment["SPACEMAP_INCREMENTAL"] != nil {
+        var largest: UInt32 = 0
+        var largestBytes: UInt64 = 0
+        var stack: [DiskNode] = [result.root]
+        while let node = stack.popLast() {
+            if node.isDirectory { stack.append(contentsOf: node.children) }
+            else if node.allocatedBytes > largestBytes { largest = node.index; largestBytes = node.allocatedBytes }
+        }
+        let path = DiskNode(tree: tree, index: largest).path
+        let before = tree.root.allocatedBytes
+        let removeStart = ProcessInfo.processInfo.systemUptime
+        IncrementalUpdater.remove(path: path, from: tree)
+        let removeElapsed = ProcessInfo.processInfo.systemUptime - removeStart
+        print(String(format: "remove_largest_file=%.3fms bytes=%llu root_delta_ok=%@", removeElapsed * 1000, largestBytes,
+                     String(before - tree.root.allocatedBytes == largestBytes)))
+        let parentPath = (path as NSString).deletingLastPathComponent
+        let refreshStart = ProcessInfo.processInfo.systemUptime
+        if let patch = IncrementalUpdater.prepare(tree: tree, path: parentPath, recursive: false, includeHidden: true) {
+            IncrementalUpdater.apply(patch)
+        }
+        print(String(format: "refresh_parent_dir=%.3fms", (ProcessInfo.processInfo.systemUptime - refreshStart) * 1000))
+        let cacheURL = URL(fileURLWithPath: NSTemporaryDirectory()).appending(path: "spacemap-bench-cache.bin")
+        let saveStart = ProcessInfo.processInfo.systemUptime
+        let compact = tree.compacted()
+        print(String(format: "compact=%.2fs", ProcessInfo.processInfo.systemUptime - saveStart))
+        try ScanCache.save(compact, header: .init(rootPath: compact.rootPath, includeHidden: true, eventId: 0, volumeUUID: nil, entries: 0), to: cacheURL)
+        let saveElapsed = ProcessInfo.processInfo.systemUptime - saveStart
+        let loadStart = ProcessInfo.processInfo.systemUptime
+        let loaded = try ScanCache.load(from: cacheURL)
+        let loadElapsed = ProcessInfo.processInfo.systemUptime - loadStart
+        let size = (try? FileManager.default.attributesOfItem(atPath: cacheURL.path)[.size] as? Int) ?? 0
+        print(String(format: "cache_save=%.2fs cache_load=%.2fs cache_file=%.1fMB loaded_nodes=%d", saveElapsed, loadElapsed, Double(size) / 1_048_576, loaded.tree.nodeCount))
+        try? FileManager.default.removeItem(at: cacheURL)
+    }
 } catch {
     fputs("spacemap-bench: \(error.localizedDescription)\n", stderr)
     exit(EXIT_FAILURE)

@@ -32,7 +32,7 @@ public enum Squarifier {
         var remaining = usable.enumerated().map { index, item in
             WeightedNode(node: item.node, weight: sourceWeights[index] * rect.width * rect.height / total)
         }.sorted {
-            if $0.weight == $1.weight { return $0.node.path < $1.node.path }
+            if $0.weight == $1.weight { return $0.node.index < $1.node.index }
             return $0.weight > $1.weight
         }
 

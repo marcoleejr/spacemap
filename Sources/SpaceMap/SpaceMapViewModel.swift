@@ -1,7 +1,15 @@
 import AppKit
 import SpaceMapCore
 import Foundation
+import OSLog
 import SwiftUI
+
+private let log = Logger(subsystem: "com.marcoleejr.spacemap", category: "incremental")
+
+private func trace(_ message: String) {
+    log.notice("\(message, privacy: .public)")
+    if ProcessInfo.processInfo.environment["SPACEMAP_TRACE"] != nil { FileHandle.standardError.write(Data((message + "\n").utf8)) }
+}
 
 @MainActor
 final class SpaceMapViewModel: ObservableObject {
@@ -23,7 +31,32 @@ final class SpaceMapViewModel: ObservableObject {
     @Published private(set) var rootURL: URL
     @Published var statusMessage: String?
 
+    /// Bumped whenever the tree changes in place (trash, FSEvents), so views
+    /// that cache layouts know to rebuild them.
+    @Published private(set) var treeVersion = 0
+    /// Entries of the previous scan of this root, for a real progress fraction.
+    @Published private(set) var expectedEntries: Int?
+    @Published private(set) var volumeName = ""
+    @Published private(set) var volumeFree: UInt64?
+    @Published private(set) var volumeTotal: UInt64?
+
     private var cancellation: ScanCancellation?
+    private var watcher: FileSystemWatcher?
+    /// Highest FSEvents id whose changes are already in the tree.
+    private var eventTracker = AppliedEventTracker(applied: 0)
+    private var cacheDirty = false
+    private var cacheSaveWork: DispatchWorkItem?
+    private var derivedWork: DispatchWorkItem?
+    /// Serial utility queue for directory rereads, compaction and cache writes.
+    private let updateQueue = DispatchQueue(label: "SpaceMap.incremental", qos: .utility)
+    /// The window's model, for the app delegate's quit-time cache save.
+    static weak var current: SpaceMapViewModel?
+    /// Background churn (logs, browser caches) is folded into the tree right
+    /// away but shown only once it adds up, so a busy home folder does not
+    /// keep the map redrawing while the app sits idle.
+    private var pendingBackgroundBytes: UInt64 = 0
+    private var pendingBackgroundFlush: DispatchWorkItem?
+    private var lastDerivedAt: Date = .distantPast
     private var scanGeneration = UUID()
     private var scopedURL: URL?
     private var activationObserver: NSObjectProtocol?
@@ -43,6 +76,8 @@ final class SpaceMapViewModel: ObservableObject {
         ) { [weak self] _ in
             Task { @MainActor in self?.refreshFullDiskAccess() }
         }
+        SpaceMapViewModel.current = self
+        refreshVolume()
     }
 
     /// True when access was just granted after a scan that ran restricted,
@@ -86,12 +121,54 @@ final class SpaceMapViewModel: ObservableObject {
         scan(at: rootURL)
     }
 
+    /// First appearance: reopen the previous map from the on-disk cache and
+    /// catch up through FSEvents history; scan from scratch only when the
+    /// cache is missing, for another root, or its event history is unusable.
+    func launch() {
+        let root = rootURL.standardizedFileURL
+        let hidden = includeHiddenFiles
+        guard let header = ScanCache.readHeader(), header.rootPath == root.path, header.includeHidden == hidden,
+              header.volumeUUID != nil, header.volumeUUID == FileSystemWatcher.volumeUUID(forPath: root.path) else {
+            trace("launch: no usable cache, full scan")
+            scan(at: root)
+            return
+        }
+        isScanning = true
+        expectedEntries = header.entries
+        let generation = UUID()
+        scanGeneration = generation
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let loaded = try? ScanCache.load()
+            Task { @MainActor [weak self] in
+                guard let self, self.scanGeneration == generation else { return }
+                guard let loaded, loaded.header.rootPath == root.path else {
+                    self.scan(at: root)
+                    return
+                }
+                self.install(tree: loaded.tree, metrics: ScanMetrics(
+                    entriesScanned: loaded.header.entries, inaccessibleEntries: 0, errors: 0,
+                    deduplicatedHardlinks: 0, duration: loaded.header.scanDuration, cancelled: false
+                ))
+                self.isScanning = false
+                if let initial = self.initialSelection(in: loaded.tree.root) { self.selectedPath = initial }
+                trace("launch: opened cached map (\(loaded.header.entries) entries), replaying FSEvents since \(loaded.header.eventId)")
+                self.eventTracker.reset(to: loaded.header.eventId)
+                // Replays every change since the cached scan, then keeps watching.
+                self.startWatching(since: loaded.header.eventId)
+            }
+        }
+    }
+
     func scanHome() {
         scan(at: FileManager.default.homeDirectoryForCurrentUser)
     }
 
     func scan(at url: URL) {
         cancellation?.cancel()
+        verification?.cancel()
+        verification = nil
+        stopWatching()
+        pendingPaths = [:]
         if let scopedURL { scopedURL.stopAccessingSecurityScopedResource() }
         scopedURL = nil
         let standardized = url.standardizedFileURL
@@ -112,6 +189,10 @@ final class SpaceMapViewModel: ObservableObject {
         categoryFootprint = [:]
         metrics = ScanMetrics(entriesScanned: 0, inaccessibleEntries: 0, errors: 0, deduplicatedHardlinks: 0, duration: 0, cancelled: false)
         statusMessage = nil
+        if let header = ScanCache.readHeader(), header.rootPath == standardized.path { expectedEntries = header.entries }
+        else { expectedEntries = nil }
+        // Events during the scan are replayed from here once it finishes.
+        let eventIdAtStart = FileSystemWatcher.currentEventId
 
         let placeholder = DiskNode(
             path: standardized.path,
@@ -125,7 +206,7 @@ final class SpaceMapViewModel: ObservableObject {
         )
         rootNode = placeholder
 
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        DispatchQueue.global(qos: .utility).async { [weak self] in
             let restricted = FullDiskAccessProbe.isRestricted()
             Task { @MainActor [weak self] in
                 guard let self, self.scanGeneration == generation else { return }
@@ -141,17 +222,16 @@ final class SpaceMapViewModel: ObservableObject {
                         self.metrics = update.metrics
                     }
                 }
-                let cleanup = CleanupCandidates.collect(root: result.root, rootPath: standardized.path)
-                let footprint = SpaceMapViewModel.footprint(of: result.root)
                 Task { @MainActor [weak self] in
                     guard let self, self.scanGeneration == generation else { return }
-                    self.rootNode = result.root
-                    self.metrics = result.metrics
-                    self.cleanupCandidates = cleanup.items
-                    self.cleanupTotalBytes = cleanup.totalBytes
-                    self.categoryFootprint = footprint
+                    self.install(tree: result.root.tree, metrics: result.metrics)
                     self.isScanning = false
                     self.selectedPath = self.initialSelection(in: result.root) ?? result.root.path
+                    guard !result.metrics.cancelled else { return }
+                    self.eventTracker.reset(to: eventIdAtStart)
+                    self.startWatching(since: eventIdAtStart)
+                    self.cacheDirty = true
+                    self.scheduleCacheSave(after: 2)
                 }
             } catch {
                 Task { @MainActor [weak self] in
@@ -178,6 +258,281 @@ final class SpaceMapViewModel: ObservableObject {
     func cancelScan() {
         cancellation?.cancel()
         isScanning = false
+    }
+
+    // MARK: - Incremental updates
+
+    private var verification: ScanCancellation?
+
+    /// FSEvents lost track (dropped events): rescan quietly with a few
+    /// threads while the current map stays usable, then swap it in.
+    private func verifyInBackground() {
+        guard verification == nil, !isScanning else { return }
+        stopWatching()
+        pendingPaths = [:]
+        let token = ScanCancellation()
+        verification = token
+        let root = rootURL
+        let hidden = includeHiddenFiles
+        let generation = scanGeneration
+        let eventIdAtStart = FileSystemWatcher.currentEventId
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let result = try? ScanEngine.scan(rootURL: root, includeHidden: hidden, cancellation: token, workers: 3)
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.verification = nil
+                guard let result, !result.metrics.cancelled, self.scanGeneration == generation else { return }
+                trace("background verification done: \(result.metrics.entriesScanned) entries in \(Int(result.metrics.duration)) s")
+                self.install(tree: result.root.tree, metrics: result.metrics)
+                if let selectedPath = self.selectedPath, result.root.tree.index(forPath: selectedPath) == nil { self.selectedPath = root.path }
+                if let focus = self.focusedRootPath, result.root.tree.index(forPath: focus) == nil { self.focusedRootPath = root.path }
+                self.eventTracker.reset(to: eventIdAtStart)
+                self.startWatching(since: eventIdAtStart)
+                self.cacheDirty = true
+                self.scheduleCacheSave(after: 2)
+            }
+        }
+    }
+
+    private func install(tree: DiskTree, metrics: ScanMetrics) {
+        rootNode = tree.root
+        self.metrics = metrics
+        treeVersion &+= 1
+        refreshVolume()
+        recomputeDerived(delay: 0)
+    }
+
+    /// Cleanup candidates and the legend footprint, recomputed off the main
+    /// thread (read-locked) after the tree changes.
+    private func recomputeDerived(delay: TimeInterval = 0.5) {
+        if let pending = derivedWork, !pending.isCancelled, delay > 1 { return } // a queued pass picks this change up
+        derivedWork?.cancel()
+        guard let tree = rootNode?.tree else { return }
+        let rootPath = rootURL.path
+        let work = DispatchWorkItem { [weak self] in
+            let (cleanup, footprint) = tree.read {
+                (CleanupCandidates.collect(root: tree.root, rootPath: rootPath), tree.footprint())
+            }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.derivedWork = nil
+                self.lastDerivedAt = Date()
+                guard self.rootNode?.tree === tree else { return }
+                self.cleanupCandidates = cleanup.items
+                self.cleanupTotalBytes = cleanup.totalBytes
+                self.categoryFootprint = footprint
+            }
+        }
+        derivedWork = work
+        updateQueue.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    private func startWatching(since eventId: UInt64) {
+        stopWatching()
+        let rootPath = rootURL.path
+        // FSEvents reports canonical paths (/private/tmp for /tmp).
+        let canonical = URL(fileURLWithPath: rootPath).resolvingSymlinksInPath().path
+        watcher = FileSystemWatcher(path: rootPath, since: eventId, latency: 2.0) { [weak self] raw in
+            let events = canonical == rootPath ? raw : raw.map {
+                FileSystemEvent(path: $0.path.hasPrefix(canonical) ? rootPath + $0.path.dropFirst(canonical.count) : $0.path, flags: $0.flags, id: $0.id)
+            }
+            let plan = FileSystemEventPlanner.plan(events, rootPath: rootPath)
+            let latest = events.map(\.id).max() ?? 0
+            Task { @MainActor [weak self] in self?.handle(plan, latestEventId: latest) }
+        }
+    }
+
+    private func stopWatching() {
+        watcher?.stop()
+        watcher = nil
+    }
+
+    private func handle(_ plan: FileSystemEventPlanner.Plan, latestEventId: UInt64) {
+        guard !isScanning, let tree = rootNode?.tree else { return }
+        switch plan {
+        case .nothing:
+            // Credit the id only once earlier batches have landed.
+            if draining || !pendingPaths.isEmpty { pendingEventId = max(pendingEventId, latestEventId) }
+            else { eventTracker.batchFinished(upTo: latestEventId, failures: 0) }
+        case .fullRescan:
+            trace("FSEvents dropped events or the root changed: verifying in the background")
+            verifyInBackground()
+        case let .refresh(paths):
+            refresh(paths: paths, in: tree, latestEventId: latestEventId)
+        }
+    }
+
+    /// Directories waiting to be reread. Events that arrive while a pass is
+    /// running merge here, so a folder that changes every second is reread
+    /// once per pass instead of piling up stale work.
+    private var pendingPaths: [String: Bool] = [:]
+    private var pendingEventId: UInt64 = 0
+    private var pendingUserInitiated = false
+    private var draining = false
+
+    /// Rereads only the directories that changed and applies each delta up
+    /// to the root. Nothing else in the tree is touched.
+    private func refresh(paths: [String: Bool], in tree: DiskTree, latestEventId: UInt64 = 0, userInitiated: Bool = false) {
+        for (path, recursive) in paths { pendingPaths[path] = (pendingPaths[path] ?? false) || recursive }
+        pendingEventId = max(pendingEventId, latestEventId)
+        pendingUserInitiated = pendingUserInitiated || userInitiated
+        drainPending()
+    }
+
+    private func drainPending() {
+        guard !draining, !pendingPaths.isEmpty, let tree = rootNode?.tree else { return }
+        draining = true
+        let batch = pendingPaths
+        let eventId = pendingEventId
+        let userInitiated = pendingUserInitiated
+        pendingPaths = [:]
+        pendingUserInitiated = false
+        let hidden = includeHiddenFiles
+        let before = tree.root.allocatedBytes
+        updateQueue.async { [weak self] in
+            var changed = false
+            var failures = 0
+            var relink: [String] = []
+            // Parents first, and each patch lands before the next directory is
+            // read, so every read sees the tree as it is now.
+            for path in batch.keys.sorted() {
+                let patch: DirectoryPatch
+                switch IncrementalUpdater.preparation(tree: tree, path: path, recursive: batch[path] ?? false, includeHidden: hidden) {
+                case let .patch(prepared): patch = prepared
+                case .unchanged: continue
+                case .failed:
+                    failures += 1
+                    continue
+                }
+                let result = DispatchQueue.main.sync {
+                    MainActor.assumeIsolated { () -> (applied: Bool, relink: [String]) in
+                        guard self?.rootNode?.tree === tree else { return (false, []) }
+                        return IncrementalUpdater.applyReturningRelinks(patch)
+                    }
+                }
+                changed = changed || result.applied
+                relink += result.relink
+            }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.draining = false
+                self.eventTracker.batchFinished(upTo: eventId, failures: failures)
+                // Another link of a removed hard-linked file now carries its space.
+                if !relink.isEmpty { trace("relink \(relink.count): \(relink.prefix(3)) failures=\(failures) batch=\(batch.count)") }
+                for path in relink where self.pendingPaths[path] == nil { self.pendingPaths[path] = false }
+                if changed, self.rootNode?.tree === tree { self.noteChange(in: tree, bytesBefore: before, userInitiated: userInitiated) }
+                self.drainPending()
+            }
+        }
+    }
+
+    private func noteChange(in tree: DiskTree, bytesBefore before: UInt64, userInitiated: Bool) {
+        let after = tree.root.allocatedBytes
+        cacheDirty = true
+        scheduleCacheSave(after: 120)
+        if userInitiated { treeDidChange(); return }
+        pendingBackgroundBytes &+= after > before ? after - before : before - after
+        // Visible change (≥0.1% of the scan, e.g. a download landing): show it now.
+        if pendingBackgroundBytes >= max(64 << 20, after / 1000) { treeDidChange(userInitiated: false); return }
+        if pendingBackgroundFlush == nil {
+            let work = DispatchWorkItem { [weak self] in
+                Task { @MainActor [weak self] in self?.treeDidChange(userInitiated: false) }
+            }
+            pendingBackgroundFlush = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 60, execute: work)
+        }
+    }
+
+    private func treeDidChange(userInitiated: Bool = true) {
+        pendingBackgroundFlush?.cancel()
+        pendingBackgroundFlush = nil
+        pendingBackgroundBytes = 0
+        guard let tree = rootNode?.tree else { return }
+        rootNode = tree.root
+        treeVersion &+= 1
+        metrics = ScanMetrics(entriesScanned: tree.liveNodeCount, inaccessibleEntries: metrics.inaccessibleEntries,
+                              errors: metrics.errors, deduplicatedHardlinks: metrics.deduplicatedHardlinks,
+                              duration: metrics.duration, cancelled: false)
+        if let selectedPath, tree.index(forPath: selectedPath) == nil {
+            // Keep the user where they were: the nearest folder that still exists.
+            self.selectedPath = tree.deepestNode(forPath: selectedPath).map { DiskNode(tree: tree, index: $0.index).path } ?? rootURL.path
+        }
+        if let focusedRootPath, tree.index(forPath: focusedRootPath) == nil { self.focusedRootPath = rootURL.path }
+        markedPaths = markedPaths.filter { tree.index(forPath: $0) != nil }
+        refreshVolume()
+        // The candidate walk touches every node: right away after the user's
+        // own action, at most once a minute for background churn.
+        recomputeDerived(delay: max(0.3, (userInitiated ? 0 : 60) - Date().timeIntervalSince(lastDerivedAt)))
+        cacheDirty = true
+        scheduleCacheSave(after: 120)
+        compactIfNeeded(tree)
+    }
+
+    /// Removed and replaced subtrees leave unreachable nodes behind; once
+    /// they are a sizeable share, rebuild the arena without them.
+    private func compactIfNeeded(_ tree: DiskTree) {
+        guard tree.garbageNodes > max(100_000, tree.liveNodeCount / 3) else { return }
+        updateQueue.async { [weak self] in
+            let (copy, version) = tree.read { (tree.compacted(), tree.version) }
+            Task { @MainActor [weak self] in
+                guard let self, self.rootNode?.tree === tree, tree.version == version else { return }
+                self.rootNode = copy.root
+                self.treeVersion &+= 1
+                self.recomputeDerived(delay: 0)
+            }
+        }
+    }
+
+    private func scheduleCacheSave(after delay: TimeInterval) {
+        // Never postpone a save that is already due: steady churn would starve it.
+        if cacheSaveWork != nil, !(cacheSaveWork?.isCancelled ?? true) { return }
+        let work = DispatchWorkItem { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.cacheSaveWork = nil
+                self?.saveCache()
+            }
+        }
+        cacheSaveWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    /// Quit path: the save (and any compaction) runs on the update queue so
+    /// the main thread stays responsive; `completion` runs on main after it.
+    func saveCacheBeforeQuit(completion: @escaping () -> Void) {
+        cacheSaveWork?.cancel()
+        saveCache(completion: completion)
+    }
+
+    private func saveCache(completion: (() -> Void)? = nil) {
+        guard cacheDirty, !isScanning, let tree = rootNode?.tree, !metrics.cancelled else {
+            if let completion { DispatchQueue.main.async(execute: completion) }
+            return
+        }
+        cacheDirty = false
+        let header = ScanCache.Header(
+            rootPath: tree.rootPath,
+            includeHidden: includeHiddenFiles,
+            eventId: eventTracker.applied,
+            volumeUUID: FileSystemWatcher.volumeUUID(forPath: tree.rootPath),
+            entries: max(metrics.entriesScanned, tree.liveNodeCount),
+            scanDuration: metrics.duration
+        )
+        updateQueue.async {
+            tree.read {
+                let source = tree.garbageNodes == 0 ? tree : tree.compacted()
+                try? ScanCache.save(source, header: header)
+            }
+            if let completion { DispatchQueue.main.async(execute: completion) }
+        }
+    }
+
+    func refreshVolume() {
+        // A fresh URL each time: URL instances cache resource values.
+        let url = URL(fileURLWithPath: rootURL.path)
+        let values = try? url.resourceValues(forKeys: [.volumeNameKey, .volumeAvailableCapacityKey, .volumeTotalCapacityKey])
+        volumeName = values?.volumeName ?? rootURL.path
+        volumeFree = values?.volumeAvailableCapacity.map { UInt64(max(0, $0)) }
+        volumeTotal = values?.volumeTotalCapacity.map { UInt64(max(0, $0)) }
     }
 
     func select(_ path: String) {
@@ -248,27 +603,35 @@ final class SpaceMapViewModel: ObservableObject {
     func moveToTrash(_ node: DiskNode? = nil) throws {
         guard let node = node ?? selectedNode else { return }
         var resultingURL: NSURL?
-        try FileManager.default.trashItem(at: URL(fileURLWithPath: node.path), resultingItemURL: &resultingURL)
-        markedPaths.remove(node.path)
-        scan(at: rootURL)
+        let path = node.path
+        let started = ProcessInfo.processInfo.systemUptime
+        try FileManager.default.trashItem(at: URL(fileURLWithPath: path), resultingItemURL: &resultingURL)
+        markedPaths.remove(path)
+        // No rescan: drop the node and subtract it from every ancestor.
+        let trashed = ProcessInfo.processInfo.systemUptime
+        guard let tree = rootNode?.tree else { return }
+        let removal = IncrementalUpdater.removeReturningRelinks(path: path, from: tree)
+        guard removal.removed else { return }
+        treeDidChange()
+        // Hard-linked files keep their space through another link: count that one.
+        if !removal.relink.isEmpty { refresh(paths: Dictionary(uniqueKeysWithValues: removal.relink.map { ($0, false) }), in: tree, userInitiated: true) }
+        let updated = ProcessInfo.processInfo.systemUptime
+        trace(String(format: "trash: moved in %.1f ms, tree + totals + volume updated in %.1f ms (no rescan)", (trashed - started) * 1000, (updated - trashed) * 1000))
+        // Our own FSEvents are ignored, so pick up the item's new home in the
+        // Trash (inside the scan root for ~) explicitly.
+        if let destination = (resultingURL as URL?)?.deletingLastPathComponent().standardizedFileURL.path,
+           tree.index(forPath: destination) != nil {
+            refresh(paths: [destination: false], in: tree, userInitiated: true)
+        }
     }
 
     /// Leaf file bytes per category for the legend. Directories aggregate
     /// their children, so only leaves are counted (each byte exactly once).
     nonisolated static func footprint(of root: DiskNode) -> [DiskCategory: UInt64] {
-        var totals: [DiskCategory: UInt64] = [:]
-        var stack = [root]
-        while let node = stack.popLast() {
-            if node.isDirectory { stack.append(contentsOf: node.children) }
-            else { totals[node.category, default: 0] &+= node.allocatedBytes }
-        }
-        return totals
+        root.tree.read { root.tree.footprint(from: root.index) }
     }
 
     func volumeDetails() -> (name: String, free: UInt64?, total: UInt64?) {
-        let values = try? rootURL.resourceValues(forKeys: [.volumeNameKey, .volumeAvailableCapacityForImportantUsageKey, .volumeTotalCapacityKey])
-        let free = values?.volumeAvailableCapacityForImportantUsage.map { UInt64(max(0, $0)) }
-        let total = values?.volumeTotalCapacity.map { UInt64(max(0, $0)) }
-        return (values?.volumeName ?? rootURL.path, free, total)
+        (volumeName, volumeFree, volumeTotal)
     }
 }
